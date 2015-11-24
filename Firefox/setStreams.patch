@@ -1,0 +1,726 @@
+changeset:   269912:3355dc6d6914
+tag:         tip
+user:        ruengeler <i.ruengeler@fh-muenster.de>
+date:        Wed Nov 04 07:03:23 2015 -0800
+summary:     Set and increase stream ids.
+
+diff --git a/netwerk/base/nsISocketTransport.idl b/netwerk/base/nsISocketTransport.idl
+--- a/netwerk/base/nsISocketTransport.idl
++++ b/netwerk/base/nsISocketTransport.idl
+@@ -111,16 +111,30 @@ interface nsISocketTransport : nsITransp
+     void          setTimeout(in unsigned long aType, in unsigned long aValue);
+ 
+     /**
+      * Values for the aType parameter passed to get/setTimeout.
+      */
+     const unsigned long TIMEOUT_CONNECT    = 0;
+     const unsigned long TIMEOUT_READ_WRITE = 1;
+ 
++    // Get the SCTP stream on which the next piece of data will be read.
++    readonly attribute int32_t nextSctpInputStreamId;
++
++    // Get the SCTP stream on which the next piece of data will be written.
++
++    readonly attribute int32_t nextSctpOutputStreamId;
++
++    // Get the number of SCTP output streams allowed for this association.
++
++    readonly attribute int32_t numberOfSctpStreams;
++
++    // Is the socket an SCTP 1-to-1 style socket?
++    boolean isSctpSocket();
++
+     /**
+      * nsITransportEventSink status codes.
+      *
+      * Although these look like XPCOM error codes and are passed in an nsresult
+      * variable, they are *not* error codes.  Note that while they *do* overlap
+      * with existing error codes in Necko, these status codes are confined
+      * within a very limited context where no error codes may appear, so there
+      * is no ambiguity.
+diff --git a/netwerk/base/nsSocketTransport2.cpp b/netwerk/base/nsSocketTransport2.cpp
+--- a/netwerk/base/nsSocketTransport2.cpp
++++ b/netwerk/base/nsSocketTransport2.cpp
+@@ -387,29 +387,25 @@ nsSocketInputStream::Read(char *buf, uin
+         if (NS_FAILED(mCondition))
+             return (mCondition == NS_BASE_STREAM_CLOSED) ? NS_OK : mCondition;
+ 
+         fd = mTransport->GetFD_Locked();
+         if (!fd)
+             return NS_BASE_STREAM_WOULD_BLOCK;
+     }
+ 
+-  //  SOCKET_LOG(("  calling PR_Read [count=%u]\n", count));
+-
+     // cannot hold lock while calling NSPR.  (worried about the fact that PSM
+     // synchronously proxies notifications over to the UI thread, which could
+     // mistakenly try to re-enter this code.)
+-  //  int32_t n = PR_Read(fd, buf, count);
+-
+-  //  SOCKET_LOG(("  PR_Read returned [n=%d]\n", n));
+ 
+     int32_t n;
+-#if 0
++
+ #if defined(ENABLE_SCTP)
+-    if (PR_GetDescType(fd) == PR_DESC_SOCKET_SCTP_ONE_TO_ONE) {
++    if (PR_GetDescType(PR_GetIdentitiesLayer(fd, PR_NSPR_IO_LAYER)) ==
++                PR_DESC_SOCKET_SCTP_ONE_TO_ONE) {
+         PRNetAddr from;
+         uint32_t fromlen;
+ #if defined(SCTP_HAVE_EXTRCVINFO)
+         PRSctp_ExtRcvInfo eri;            // Darwin & FreeBSD only
+ #else
+         PRSctp_SndRcvInfo eri;
+ #endif
+         PRSctp_SndRcvInfo *sri = (PRSctp_SndRcvInfo *)&eri;
+@@ -425,25 +421,22 @@ nsSocketInputStream::Read(char *buf, uin
+ #if defined(SCTP_HAVE_EXTRCVINFO)
+         if (n > 0 && eri.serinfo_next_flags & SCTP_NEXT_MSG_AVAIL)
+             mTransport->mNextSctpInputStreamId = eri.serinfo_next_stream;
+ #endif
+     }
+     else
+     {
+ #endif
+-#endif
+         SOCKET_LOG(("  calling PR_Read [count=%u]\n", count));
+         n = PR_Read(fd, buf, count);
+         SOCKET_LOG(("  PR_Read returned [n=%d]\n", n));
+-#if 0
+ #if defined(ENABLE_SCTP)
+     }
+ #endif
+-#endif
+     nsresult rv = NS_OK;
+     {
+         MutexAutoLock lock(mTransport->mLock);
+ 
+ #ifdef ENABLE_SOCKET_TRACING
+         if (n > 0)
+             mTransport->TraceInBuf(buf, n);
+ #endif
+@@ -535,17 +528,16 @@ nsSocketInputStream::AsyncWait(nsIInputS
+         // OnSocketEvent will call OnInputStreamReady with an error code after
+         // going through the event loop. We do this because most socket callers
+         // do not expect AsyncWait() to synchronously execute the OnInputStreamReady
+         // callback.
+         mTransport->PostEvent(nsSocketTransport::MSG_INPUT_PENDING);
+     } else {
+         mTransport->OnInputPending();
+     }
+-
+     return NS_OK;
+ }
+ 
+ //-----------------------------------------------------------------------------
+ // socket output stream impl 
+ //-----------------------------------------------------------------------------
+ 
+ nsSocketOutputStream::nsSocketOutputStream(nsSocketTransport *trans)
+@@ -642,43 +634,42 @@ nsSocketOutputStream::Write(const char *
+         if (NS_FAILED(mCondition))
+             return mCondition;
+         
+         fd = mTransport->GetFD_Locked();
+         if (!fd)
+             return NS_BASE_STREAM_WOULD_BLOCK;
+     }
+ 
+-
+     // cannot hold lock while calling NSPR.  (worried about the fact that PSM
+     // synchronously proxies notifications over to the UI thread, which could
+     // mistakenly try to re-enter this code.)
+   //  int32_t n = PR_Write(fd, buf, count);
+ 
+     int32_t n;
+-#if 0
+ #if defined(ENABLE_SCTP)
+     uint16_t SendStream;
+-    if (PR_GetDescType(fd) == PR_DESC_SOCKET_SCTP_ONE_TO_ONE) {
++
++    if (PR_GetDescType(PR_GetIdentitiesLayer(fd, PR_NSPR_IO_LAYER)) ==
++                PR_DESC_SOCKET_SCTP_ONE_TO_ONE) {
+         SendStream = mTransport->mNextSctpOutputStreamId;
+         NS_ASSERTION(SendStream >= 0 &&
+                      SendStream < mTransport->mNumberOfSctpStreams,
+                      "Invalid SCTP stream ID");
+         SOCKET_LOG(("  calling PR_SctpSendmsg [count=%u]\n", count));
+         n = PR_SctpSendmsg(fd, buf, count, NULL, 0, 0, 0, SendStream, 0, 0, 0);
+         SOCKET_LOG(("  PR_Sctp_Sendmsg returned [n=%d]\n", n));
+ 
+         if (n > 0)
+             mTransport->mNextSctpOutputStreamId =
+                 ++(mTransport->mNextSctpOutputStreamId) %
+                 mTransport->mNumberOfSctpStreams;
+     }
+     else
+ #endif
+-#endif
+     {
+         SOCKET_LOG(("  calling PR_Write [count=%u]\n", count));
+ 
+         n = PR_Write(fd, buf, count);
+ 
+         SOCKET_LOG(("  PR_Write returned [n=%d]\n", n));
+     }
+     nsresult rv = NS_OK;
+@@ -1158,17 +1149,18 @@ nsSocketTransport::BuildSocket(PRFileDes
+     if (mTypeCount == 0) {
+ #if defined(ENABLE_SCTP)
+         fd = PR_OpenSCTPOneToOneSocket(mNetAddr.raw.family);
+ #else
+         fd = PR_OpenTCPSocket(mNetAddr.raw.family);
+ #endif
+         rv = fd ? NS_OK : NS_ERROR_OUT_OF_MEMORY;
+ #if defined(ENABLE_SCTP)
+-        if (PR_GetDescType(fd) == PR_DESC_SOCKET_SCTP_ONE_TO_ONE) {
++        if (PR_GetDescType(PR_GetIdentitiesLayer(fd, PR_NSPR_IO_LAYER)) ==
++                PR_DESC_SOCKET_SCTP_ONE_TO_ONE) {
+             if (NS_SUCCEEDED(rv)) {
+                 // Subscribe to sctp_data_io_event.
+                 PRSocketOptionData sod;
+                 memset(&sod, 0, sizeof(sod));
+                 sod.option = PR_SockOpt_Events;
+                 sod.value.events.sctp_data_io_event = 1;
+                 if (PR_SetSocketOption(fd, &sod) != PR_SUCCESS) {
+                     return NS_ERROR_SOCKET_OPTION_FAILED;
+@@ -1206,17 +1198,16 @@ nsSocketTransport::BuildSocket(PRFileDes
+                 // Set the maximum number of outgoing SCTP streams.
+                 sod.value.initmsg.sinit_num_ostreams = (uint16_t) val;
+                 sod.option = PR_SockOpt_InitMsg;
+                 if (PR_SetSocketOption(fd, &sod) != PR_SUCCESS) {
+                     return NS_ERROR_SOCKET_OPTION_FAILED;
+                 }
+                 // Initialize next SCTP output stream ID.
+                 mNextSctpOutputStreamId = 0;
+-                printf("numberof streams: %d\n", val);
+             }
+         }
+ #endif
+     }
+     else {
+ #if defined(XP_UNIX)
+         MOZ_ASSERT(!mNetAddrIsSet || mNetAddr.raw.family != AF_LOCAL,
+                    "Unix domain sockets can't be used with socket types");
+@@ -1518,82 +1509,77 @@ nsSocketTransport::InitiateSocket()
+     //
+     // Initiate the connect() to the host...
+     //
+     PRNetAddr prAddr;
+     {
+         if (mBindAddr) {
+             MutexAutoLock lock(mLock);
+             NetAddrToPRNetAddr(mBindAddr.get(), &prAddr);
++
+             status = PR_Bind(fd, &prAddr);
++
+             if (status != PR_SUCCESS) {
+                 return NS_ERROR_FAILURE;
+             }
+             mBindAddr = nullptr;
+         }
+     }
+ 
+     NetAddrToPRNetAddr(&mNetAddr, &prAddr);
+ 
+     // We use PRIntervalTime here because we need
+     // nsIOService::LastOfflineStateChange time and
+     // nsIOService::LastConectivityChange time to be atomic.
+     PRIntervalTime connectStarted = 0;
+     if (gSocketTransportService->IsTelemetryEnabled()) {
+         connectStarted = PR_IntervalNow();
+     }
+-
+     status = PR_Connect(fd, &prAddr, NS_SOCKET_CONNECT_TIMEOUT);
+-
+     if (gSocketTransportService->IsTelemetryEnabled() && connectStarted) {
+         SendPRBlockingTelemetry(connectStarted,
+             Telemetry::PRCONNECT_BLOCKING_TIME_NORMAL,
+             Telemetry::PRCONNECT_BLOCKING_TIME_SHUTDOWN,
+             Telemetry::PRCONNECT_BLOCKING_TIME_CONNECTIVITY_CHANGE,
+             Telemetry::PRCONNECT_BLOCKING_TIME_LINK_CHANGE,
+             Telemetry::PRCONNECT_BLOCKING_TIME_OFFLINE);
+     }
+ 
+     if (status == PR_SUCCESS) {
+         // 
+         // we are connected!
+         //
+-#if 0
+ #if defined(ENABLE_SCTP)
+         rv = SetNumberOfOutgoingSctpStreams(fd);
+         if(NS_FAILED(rv))
+             return rv;
+ #endif
+-#endif
+         OnSocketConnected();
+-    }
+-    else {
++    } else {
+         PRErrorCode code = PR_GetError();
+ #if defined(TEST_CONNECT_ERRORS)
+         code = RandomizeConnectError(code);
+ #endif
+         //
+         // If the PR_Connect(...) would block, then poll for a connection.
+         //
+-        if ((PR_WOULD_BLOCK_ERROR == code) || (PR_IN_PROGRESS_ERROR == code))
++        if ((PR_WOULD_BLOCK_ERROR == code) || (PR_IN_PROGRESS_ERROR == code)) {
+             mPollFlags = (PR_POLL_EXCEPT | PR_POLL_WRITE);
+         //
+         // If the socket is already connected, then return success...
+         //
+-        else if (PR_IS_CONNECTED_ERROR == code) {
++        } else if (PR_IS_CONNECTED_ERROR == code) {
+             //
+             // we are connected!
+             //
+-#if 0
+ #if defined(ENABLE_SCTP)
+             rv = SetNumberOfOutgoingSctpStreams(fd);
+             if(NS_FAILED(rv))
+                return rv;
+ #endif
+-#endif
+             OnSocketConnected();
+ 
+             if (mSecInfo && !mProxyHost.IsEmpty() && proxyTransparent && usingSSL) {
+                 // if the connection phase is finished, and the ssl layer has
+                 // been pushed, and we were proxying (transparently; ie. nothing
+                 // has to happen in the protocol layer above us), it's time for
+                 // the ssl to start doing it's thing.
+                 nsCOMPtr<nsISSLSocketControl> secCtrl =
+@@ -1806,29 +1792,29 @@ nsSocketTransport::OnSocketConnected()
+     // to trample over mFDref if mFD is already set.
+     {
+         MutexAutoLock lock(mLock);
+         NS_ASSERTION(mFD.IsInitialized(), "no socket");
+         NS_ASSERTION(mFDref == 1, "wrong socket ref count");
+         mFDconnected = true;
+     }
+ 
++#ifndef ENABLE_SCTP
+     // Ensure keepalive is configured correctly if previously enabled.
+     if (mKeepaliveEnabled) {
+         nsresult rv = SetKeepaliveEnabledInternal(true);
+         if (NS_WARN_IF(NS_FAILED(rv))) {
+             SOCKET_LOG(("  SetKeepaliveEnabledInternal failed rv[0x%x]", rv));
+         }
+     }
++#endif
+ 
+     SendStatus(NS_NET_STATUS_CONNECTED_TO);
+ }
+ 
+-
+-#if 0
+ #if defined(ENABLE_SCTP)
+ NS_IMETHODIMP
+ nsSocketTransport::SetNumberOfOutgoingSctpStreams(PRFileDesc *fd)
+ {
+     nsresult rv;
+     bool socketIsSctp;
+ 
+     rv = IsSctpSocket(&socketIsSctp);
+@@ -1844,17 +1830,16 @@ nsSocketTransport::SetNumberOfOutgoingSc
+     if (PR_GetSocketOption(fd, &sod) != PR_SUCCESS)
+         return NS_ERROR_SOCKET_OPTION_FAILED;
+ 
+     // Set number of outgoing SCTP streams
+     mNumberOfSctpStreams = sod.value.status.sstat_outstrms;
+     return NS_OK;
+ }
+ #endif
+-#endif
+ 
+ PRFileDesc *
+ nsSocketTransport::GetFD_Locked()
+ {
+     mLock.AssertCurrentThreadOwns();
+ 
+     // mFD is not available to the streams while disconnected.
+     if (!mFDconnected)
+@@ -1908,17 +1893,17 @@ nsSocketTransport::ReleaseFD_Locked(PRFi
+             PR_Close(mFD);
+         } else {
+             // Can't PR_Close() a socket off STS thread. Thunk it to STS to die
+             STS_PRCloseOnSocketTransport(mFD);
+         }
+         mFD = nullptr;
+     }
+ }
+-#if 0
++
+ #if defined(ENABLE_SCTP)
+ // Update mNextSctpInputStreamId by doing a peek
+ NS_IMETHODIMP
+ nsSocketTransport::UpdateNextSctpInputStreamId()
+ {
+     nsresult rv = NS_OK;
+ 
+     char c;
+@@ -1929,39 +1914,40 @@ nsSocketTransport::UpdateNextSctpInputSt
+ #if defined(SCTP_HAVE_EXTRCVINFO)
+     PRSctp_ExtRcvInfo eri;            // Darwin & FreeBSD only
+ #else
+     PRSctp_SndRcvInfo eri;
+ #endif
+     PRSctp_SndRcvInfo *sri = (PRSctp_SndRcvInfo*)&eri;
+     fromlen = sizeof(from);
+     memset(sri, 0, sizeof(eri));
++    {
++    MutexAutoLock lock(mLock);
+ #if defined(SCTP_1_BYTE_PEEK)  // Some implementations must read a byte to peek
+     n = PR_SctpRecvmsg(mFD, &c, 1, &from, &fromlen, sri, &msg_flags, 0);
+ #else                          // Some linux implementations consume bytes when peeking
+     n = PR_SctpRecvmsg(mFD, &c, 0, &from, &fromlen, sri, &msg_flags, 0);
+ #endif
++    }
+     mNextSctpInputStreamId = -1;
+ 
+     if (n >= 0) {
+         if (n == 0 && PR_GetError() == PR_NOT_CONNECTED_ERROR) {
+             rv = NS_BASE_STREAM_CLOSED;
+-        }
+-        else {
++        } else {
+             mNextSctpInputStreamId = sri->sinfo_stream;
+             NS_ASSERTION(mNextSctpInputStreamId >= 0 &&
+                          mNextSctpInputStreamId < mNumberOfSctpStreams,
+                          "Invalid SCTP stream ID");
+         }
++    } else if (PR_GetError() == PR_WOULD_BLOCK_ERROR) {
++        rv = NS_BASE_STREAM_WOULD_BLOCK;
++    } else {
++        rv = NS_BASE_STREAM_CLOSED;
+     }
+-    else if (PR_GetError() == PR_WOULD_BLOCK_ERROR)
+-        rv = NS_BASE_STREAM_WOULD_BLOCK;
+-    else
+-        rv = NS_BASE_STREAM_CLOSED;
+-
+     return rv;
+ }
+ #endif
+ 
+ 
+ NS_IMETHODIMP
+ nsSocketTransport::GetNextSctpInputStreamId(int32_t* aSctpStreamID)
+ {
+@@ -2031,28 +2017,32 @@ nsSocketTransport::GetNumberOfSctpStream
+ }
+ 
+ NS_IMETHODIMP
+ nsSocketTransport::IsSctpSocket(bool *aResult)
+ {
+ #if !defined(ENABLE_SCTP)
+     return NS_ERROR_NOT_IMPLEMENTED;
+ #else
++    {
++    MutexAutoLock lock(mLock);
+     *aResult = false;
+-
+     if (mFD.IsInitialized()) {
+-        if (PR_GetDescType(mFD) == PR_DESC_SOCKET_SCTP_ONE_TO_ONE)
++        if (PR_GetDescType(PR_GetIdentitiesLayer(mFD, PR_NSPR_IO_LAYER)) ==
++                PR_DESC_SOCKET_SCTP_ONE_TO_ONE) {
+             *aResult = true;
++        }
+         return NS_OK;
+     }
+-    else
++    else {
+         return NS_ERROR_SOCKET_DOES_NOT_EXIST;
++    }
++    }
+ #endif
+ }
+-#endif
+ 
+ //-----------------------------------------------------------------------------
+ // socket event handler impl
+ 
+ void
+ nsSocketTransport::OnSocketEvent(uint32_t type, nsresult status, nsISupports *param)
+ {
+     SOCKET_LOG(("nsSocketTransport::OnSocketEvent [this=%p type=%u status=%x param=%p]\n",
+@@ -2184,28 +2174,27 @@ nsSocketTransport::OnSocketReady(PRFileD
+             mOutput.OnSocketReady(NS_OK);
+         }
+         // if waiting to read and socket is readable or hit an exception.
+         if ((mPollFlags & PR_POLL_READ) && (outFlags & ~PR_POLL_WRITE)) {
+             // assume that we won't need to poll any longer (the stream will
+             // request that we poll again if it is still pending).
+             mPollFlags &= ~PR_POLL_READ;
+ 
+-#if 0
+ #if defined(ENABLE_SCTP)
+             // if SCTP socket, get stream on which data arrived
+-            if (fd->methods->file_type == PR_DESC_SOCKET_SCTP_ONE_TO_ONE) {
++            if (PR_GetDescType(PR_GetIdentitiesLayer(fd, PR_NSPR_IO_LAYER)) ==
++                PR_DESC_SOCKET_SCTP_ONE_TO_ONE) {
+                 if (NS_FAILED(UpdateNextSctpInputStreamId()))
+                     mInput.OnSocketReady(NS_ERROR_FAILURE);
+                 else
+                     mInput.OnSocketReady(NS_OK);
+             }
+             else  // not SCTP
+ #endif
+-#endif
+             mInput.OnSocketReady(NS_OK);
+         }
+         // Update poll timeout in case it was changed
+         mPollTimeout = mTimeouts[TIMEOUT_READ_WRITE];
+     }
+     else if (mState == STATE_CONNECTING) {
+ 
+         // We use PRIntervalTime here because we need
+@@ -2229,22 +2218,20 @@ nsSocketTransport::OnSocketReady(PRFileD
+ 
+         if (status == PR_SUCCESS) {
+             //
+             // we are connected!
+             //
+             OnSocketConnected();
+ 
+             OnSocketConnected();
+-#if 0
+ #if defined(ENABLE_SCTP)
+             if (NS_FAILED(SetNumberOfOutgoingSctpStreams(fd)))
+                 mInput.OnSocketReady(NS_ERROR_FAILURE);
+ #endif
+-#endif
+             if (mSocketTransportService->IsTelemetryEnabled()) {
+                 if (mNetAddr.raw.family == AF_INET) {
+                     Telemetry::Accumulate(
+                         Telemetry::IPV4_AND_IPV6_ADDRESS_CONNECTIVITY,
+                         SUCCESSFUL_CONNECTING_TO_IPV4_ADDRESS);
+                 } else if (mNetAddr.raw.family == AF_INET6) {
+                     Telemetry::Accumulate(
+                         Telemetry::IPV4_AND_IPV6_ADDRESS_CONNECTIVITY,
+@@ -2580,27 +2567,28 @@ nsSocketTransport::IsAlive(bool *result)
+     if (NS_FAILED(conditionWhileLocked) || !fd.IsInitialized()) {
+         return NS_OK;
+     }
+ 
+     // XXX do some idle-time based checks??
+ 
+     char c;
+     int32_t rval;
+-#if 0
++
+ #if defined(ENABLE_SCTP)
+-    if (PR_GetDescType(fd) == PR_DESC_SOCKET_SCTP_ONE_TO_ONE) {
++    if (PR_GetDescType(PR_GetIdentitiesLayer(fd, PR_NSPR_IO_LAYER)) ==
++                PR_DESC_SOCKET_SCTP_ONE_TO_ONE) {
+         nsresult rv;
+         rv = UpdateNextSctpInputStreamId();
+         if (NS_SUCCEEDED(rv) || rv == NS_BASE_STREAM_WOULD_BLOCK)
+             *result = true;
+     }
+     else
+ #endif
+-#endif
++
+         if (((rval = PR_Recv(fd, &c, 1, PR_MSG_PEEK, 0)) > 0) ||
+             (rval < 0 && PR_GetError() == PR_WOULD_BLOCK_ERROR))
+             *result = true;
+     return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsSocketTransport::GetHost(nsACString &host)
+@@ -2926,33 +2914,36 @@ nsSocketTransport::SetConnectionFlags(ui
+     mConnectionFlags = value;
+     mIsPrivate = value & nsISocketTransport::NO_PERMANENT_STORAGE;
+     return NS_OK;
+ }
+ 
+ void
+ nsSocketTransport::OnKeepaliveEnabledPrefChange(bool aEnabled)
+ {
++#ifndef ENABLE_SCTP
+     MOZ_ASSERT(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 
+     // The global pref toggles keepalive as a system feature; it only affects
+     // an individual socket if keepalive has been specifically enabled for it.
+     // So, ensure keepalive is configured correctly if previously enabled.
+     if (mKeepaliveEnabled) {
+         nsresult rv = SetKeepaliveEnabledInternal(aEnabled);
+         if (NS_WARN_IF(NS_FAILED(rv))) {
+             SOCKET_LOG(("  SetKeepaliveEnabledInternal [%s] failed rv[0x%x]",
+                         aEnabled ? "enable" : "disable", rv));
+         }
+     }
++#endif
+ }
+ 
+ nsresult
+ nsSocketTransport::SetKeepaliveEnabledInternal(bool aEnable)
+ {
++#ifndef ENABLE_SCTP
+     MOZ_ASSERT(mKeepaliveIdleTimeS > 0 &&
+                mKeepaliveIdleTimeS <= kMaxTCPKeepIdle);
+     MOZ_ASSERT(mKeepaliveRetryIntervalS > 0 &&
+                mKeepaliveRetryIntervalS <= kMaxTCPKeepIntvl);
+     MOZ_ASSERT(mKeepaliveProbeCount > 0 &&
+                mKeepaliveProbeCount <= kMaxTCPKeepCount);
+ 
+     PRFileDescAutoLock fd(this);
+@@ -2971,31 +2962,35 @@ nsSocketTransport::SetKeepaliveEnabledIn
+         SOCKET_LOG(("  SetKeepaliveVals failed rv[0x%x]", rv));
+         return rv;
+     }
+     rv = fd.SetKeepaliveEnabled(enable);
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+         SOCKET_LOG(("  SetKeepaliveEnabled failed rv[0x%x]", rv));
+         return rv;
+     }
++#endif
+     return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsSocketTransport::GetKeepaliveEnabled(bool *aResult)
+ {
++#ifndef ENABLE_SCTP
+     MOZ_ASSERT(aResult);
+ 
+     *aResult = mKeepaliveEnabled;
++#endif
+     return NS_OK;
+ }
+ 
+ nsresult
+ nsSocketTransport::EnsureKeepaliveValsAreInitialized()
+ {
++#ifndef ENABLE_SCTP
+     nsresult rv = NS_OK;
+     int32_t val = -1;
+     if (mKeepaliveIdleTimeS == -1) {
+         rv = mSocketTransportService->GetKeepaliveIdleTime(&val);
+         if (NS_WARN_IF(NS_FAILED(rv))) {
+             return rv;
+         }
+         mKeepaliveIdleTimeS = val;
+@@ -3009,22 +3004,24 @@ nsSocketTransport::EnsureKeepaliveValsAr
+     }
+     if (mKeepaliveProbeCount == -1) {
+         rv = mSocketTransportService->GetKeepaliveProbeCount(&val);
+         if (NS_WARN_IF(NS_FAILED(rv))) {
+             return rv;
+         }
+         mKeepaliveProbeCount = val;
+     }
++#endif
+     return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsSocketTransport::SetKeepaliveEnabled(bool aEnable)
+ {
++#ifndef ENABLE_SCTP
+ #if defined(XP_WIN) || defined(XP_UNIX) || defined(XP_MACOSX)
+     MOZ_ASSERT(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+ 
+     if (aEnable == mKeepaliveEnabled) {
+         SOCKET_LOG(("nsSocketTransport::SetKeepaliveEnabled [%p] already %s.",
+                     this, aEnable ? "enabled" : "disabled"));
+         return NS_OK;
+     }
+@@ -3059,22 +3056,25 @@ nsSocketTransport::SetKeepaliveEnabled(b
+         return rv;
+     }
+ 
+     return NS_OK;
+ #else /* !(defined(XP_WIN) || defined(XP_UNIX) || defined(XP_MACOSX)) */
+     SOCKET_LOG(("nsSocketTransport::SetKeepaliveEnabled unsupported platform"));
+     return NS_ERROR_NOT_IMPLEMENTED;
+ #endif
++#endif
++    return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsSocketTransport::SetKeepaliveVals(int32_t aIdleTime,
+                                     int32_t aRetryInterval)
+ {
++#ifndef ENABLE_SCTP
+ #if defined(XP_WIN) || defined(XP_UNIX) || defined(XP_MACOSX)
+     MOZ_ASSERT(PR_GetCurrentThread() == gSocketThread, "wrong thread");
+     if (NS_WARN_IF(aIdleTime <= 0 || kMaxTCPKeepIdle < aIdleTime)) {
+         return NS_ERROR_INVALID_ARG;
+     }
+     if (NS_WARN_IF(aRetryInterval <= 0 ||
+                    kMaxTCPKeepIntvl < aRetryInterval)) {
+         return NS_ERROR_INVALID_ARG;
+@@ -3120,16 +3120,19 @@ nsSocketTransport::SetKeepaliveVals(int3
+     if (NS_WARN_IF(NS_FAILED(rv))) {
+         return rv;
+     }
+     return NS_OK;
+ #else
+     SOCKET_LOG(("nsSocketTransport::SetKeepaliveVals unsupported platform"));
+     return NS_ERROR_NOT_IMPLEMENTED;
+ #endif
++#endif
++    SOCKET_LOG(("nsSocketTransport::SetKeepaliveVals unsupported protocol"));
++    return NS_ERROR_NOT_IMPLEMENTED;
+ }
+ 
+ #ifdef ENABLE_SOCKET_TRACING
+ 
+ #include <stdio.h>
+ #include <ctype.h>
+ #include "prenv.h"
+ 
+diff --git a/netwerk/base/nsSocketTransport2.h b/netwerk/base/nsSocketTransport2.h
+--- a/netwerk/base/nsSocketTransport2.h
++++ b/netwerk/base/nsSocketTransport2.h
+@@ -376,16 +376,20 @@ private:
+     // socket timeouts are not protected by any lock.
+     uint16_t mTimeouts[2];
+ 
+ #if defined(ENABLE_SCTP)
+         // SCTP Stream Id tracking information
+     int32_t  mNextSctpInputStreamId;   // Need to allow -1 as a legitimate value
+     uint16_t mNextSctpOutputStreamId;
+     uint16_t mNumberOfSctpStreams;
++
++    // Method to peek for SCTP stream id of next SCTP message to be read.
++    nsresult UpdateNextSctpInputStreamId();
++    nsresult SetNumberOfOutgoingSctpStreams(PRFileDesc *fd);
+ #endif
+     // QoS setting for socket
+     uint8_t mQoSBits;
+ 
+     //
+     // mFD access methods: called with mLock held.
+     //
+     PRFileDesc *GetFD_Locked();
+diff --git a/netwerk/protocol/http/TunnelUtils.cpp b/netwerk/protocol/http/TunnelUtils.cpp
+--- a/netwerk/protocol/http/TunnelUtils.cpp
++++ b/netwerk/protocol/http/TunnelUtils.cpp
+@@ -1594,16 +1594,20 @@ FWD_TS_ADDREF(GetScriptablePeerAddr, nsI
+ FWD_TS_ADDREF(GetScriptableSelfAddr, nsINetAddr);
+ FWD_TS_ADDREF(GetSecurityInfo, nsISupports);
+ FWD_TS_ADDREF(GetSecurityCallbacks, nsIInterfaceRequestor);
+ FWD_TS_PTR(IsAlive, bool);
+ FWD_TS_PTR(GetConnectionFlags, uint32_t);
+ FWD_TS(SetConnectionFlags, uint32_t);
+ FWD_TS_PTR(GetRecvBufferSize, uint32_t);
+ FWD_TS(SetRecvBufferSize, uint32_t);
++FWD_TS_PTR(GetNextSctpInputStreamId, int32_t);
++FWD_TS_PTR(GetNextSctpOutputStreamId, int32_t);
++FWD_TS_PTR(GetNumberOfSctpStreams, int32_t);
++FWD_TS_PTR(IsSctpSocket, bool);
+ 
+ NS_IMETHODIMP
+ SocketTransportShim::GetHost(nsACString & aHost)
+ {
+   return mWrapped->GetHost(aHost);
+ }
+ 
+ NS_IMETHODIMP
+

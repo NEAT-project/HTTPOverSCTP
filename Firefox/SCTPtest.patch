@@ -1,0 +1,838 @@
+changeset:   269910:3cff3344827e
+tag:         tip
+user:        ruengeler <i.ruengeler@fh-muenster.de>
+date:        Fri Oct 30 00:55:21 2015 -0700
+summary:     Add sctp.c to test clent server behaviour
+
+diff --git a/netwerk/base/nsSocketTransport2.cpp b/netwerk/base/nsSocketTransport2.cpp
+--- a/netwerk/base/nsSocketTransport2.cpp
++++ b/netwerk/base/nsSocketTransport2.cpp
+@@ -1080,17 +1080,22 @@ nsSocketTransport::BuildSocket(PRFileDes
+     SOCKET_LOG(("nsSocketTransport::BuildSocket [this=%p]\n", this));
+ 
+     nsresult rv;
+ 
+     proxyTransparent = false;
+     usingSSL = false;
+ 
+     if (mTypeCount == 0) {
++#if defined(ENABLE_SCTP)
++printf("SCTP: %s:%d PR_OpenSCTPOneToOneSocket\n", __FILE__, __LINE__);
++        fd = PR_OpenSCTPOneToOneSocket(mNetAddr.raw.family);
++#else
+         fd = PR_OpenTCPSocket(mNetAddr.raw.family);
++#endif
+         rv = fd ? NS_OK : NS_ERROR_OUT_OF_MEMORY;
+     }
+     else {
+ #if defined(XP_UNIX)
+         MOZ_ASSERT(!mNetAddrIsSet || mNetAddr.raw.family != AF_LOCAL,
+                    "Unix domain sockets can't be used with socket types");
+ #endif
+ 
+diff --git a/nsprpub/pr/tests/sctp.c b/nsprpub/pr/tests/sctp.c
+new file mode 100644
+--- /dev/null
++++ b/nsprpub/pr/tests/sctp.c
+@@ -0,0 +1,800 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* ***** BEGIN LICENSE BLOCK *****
++ * Version: MPL 1.1/GPL 2.0/LGPL 2.1
++ *
++ * The contents of this file are subject to the Mozilla Public License Version
++ * 1.1 (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ * http://www.mozilla.org/MPL/
++ *
++ * Software distributed under the License is distributed on an "AS IS" basis,
++ * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
++ * for the specific language governing rights and limitations under the
++ * License.
++ *
++ * The Original Code is the Netscape Portable Runtime (NSPR).
++ *
++ * The Initial Developer of the Original Code is
++ * Netscape Communications Corporation.
++ * Portions created by the Initial Developer are Copyright (C) 1998-2000
++ * the Initial Developer. All Rights Reserved.
++ *
++ * Contributor(s):
++ *
++ * Alternatively, the contents of this file may be used under the terms of
++ * either the GNU General Public License Version 2 or later (the "GPL"), or
++ * the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
++ * in which case the provisions of the GPL or the LGPL are applicable instead
++ * of those above. If you wish to allow use of your version of this file only
++ * under the terms of either the GPL or the LGPL, and not to allow others to
++ * use your version of this file under the terms of the MPL, indicate your
++ * decision by deleting the provisions above and replace them with the notice
++ * and other provisions required by the GPL or the LGPL. If you do not delete
++ * the provisions above, a recipient may use your version of this file under
++ * the terms of any one of the MPL, the GPL or the LGPL.
++ *
++ * ***** END LICENSE BLOCK ***** */
++
++/***********************************************************************
++ *
++ * Name: sctp.c
++ *
++ * Description: Test SCTP socket functionality.
++ *
++ * Modification History:
++ * 29-May-2009 - JLeighton - File created.  Code adapted from socket.c
++ */
++#include "primpl.h"
++
++#include "plgetopt.h"
++
++#include <stdio.h>
++#include <string.h>
++#include <errno.h>
++#ifdef XP_UNIX
++#include <sys/mman.h>
++#endif
++#if defined(_PR_PTHREADS) && !defined(_PR_DCETHREADS)
++#include <pthread.h>
++#endif
++
++/*#include <process.h>*/
++
++static int _debug_on = 1;
++
++#include "obsolete/prsem.h"
++
++/*#define DPRINTF(arg) if (_debug_on) printf arg*/
++
++#define BUF_DATA_SIZE    (2 * 1024)
++#define SCTP_MESG_SIZE    1024
++
++#define NUM_SCTP_CLIENTS                  5    /* for a listen queue depth of 5 */
++#define NUM_SCTP_CONNECTIONS_PER_CLIENT   5
++#define NUM_SCTP_MESGS_PER_CONNECTION    10
++#define NUM_SCTP_STREAMS                 10
++#define SCTP_SERVER_PORT              10000
++#define SERVER_MAX_BIND_COUNT           100
++
++static PRInt32 num_sctp_clients = NUM_SCTP_CLIENTS;
++static PRInt32 num_sctp_connections_per_client = NUM_SCTP_CONNECTIONS_PER_CLIENT;
++static PRInt32 sctp_mesg_size = SCTP_MESG_SIZE;
++static PRInt32 num_sctp_mesgs_per_connection = NUM_SCTP_MESGS_PER_CONNECTION;
++
++static PRInt32 thread_count;
++PRUint16 server_domain = PR_AF_INET, client_domain = PR_AF_INET;
++
++int failed_already=0;
++typedef struct buffer {
++    char    data[BUF_DATA_SIZE];
++} buffer;
++
++PRNetAddr sctp_server_addr;
++
++typedef struct Serve_Client_Param {
++    PRFileDesc *sockfd;    /* socket to read from/write to */
++    PRInt32    datalen;    /* bytes of data transfered in each read/write */
++} Serve_Client_Param;
++
++typedef struct Server_Param {
++    PRMonitor *exit_mon;   /* monitor to signal on exit */
++    PRInt32 *exit_counter; /* counter to decrement, before exit */
++    PRInt32    datalen;    /* bytes of data transfered in each read/write */
++    PRLock *serv_lock;     /* lock for access to serv_cond */
++    PRCondVar *serv_cond;  /* cond variable to notify after setting up address */
++} Server_Param;
++
++typedef struct Client_Param {
++    PRNetAddr server_addr;
++    PRMonitor *exit_mon;   /* monitor to signal on exit */
++    PRInt32 *exit_counter; /* counter to decrement, before exit */
++    PRInt32    datalen;
++} Client_Param;
++
++/*
++ * readn
++ *    read data from sockfd into buf
++ */
++static PRInt32
++readn(PRFileDesc *sockfd, char *buf, int len, int *stream, int *msgflags)
++{
++    int rem=0;
++    int bytes=0;
++    int offset = 0;
++    PRSctp_SndRcvInfo sinfo;
++    PRIntervalTime timeout = PR_INTERVAL_NO_TIMEOUT;
++    PRThread *thrd = PR_GetCurrentThread();
++
++    memset(&sinfo, 0, sizeof(sinfo));
++    rem = len;
++    /* read until end of message or end of buffer space */
++    while (rem && !(*msgflags & MSG_EOR)) {
++        printf("0x%p: calling PR_SctpRecvmsg, bytes = %d\n", thrd, rem);
++        *msgflags = 0;
++        bytes = PR_SctpRecvmsg(sockfd, buf + offset, rem, NULL, 0,
++                               &sinfo, msgflags, timeout);
++        rem -= bytes;
++        *stream = sinfo.sinfo_stream;
++        printf("0x%p: returning from PR_SctpRecvmsg, bytes = %d\n", thrd, bytes);
++        if (bytes < 0) {
++            return -1;
++        }	
++    }
++    return len;
++}
++
++/*
++ * SCTP_Serve_Client
++ *    Thread, started by the server, for serving a client connection.
++ *    Reads data from socket and writes it back, unmodified, and
++ *    closes the socket
++ */
++static void PR_CALLBACK
++SCTP_Serve_Client(void *arg)
++{
++    Serve_Client_Param *scp = (Serve_Client_Param *) arg;
++    PRFileDesc *sockfd;
++    buffer *in_buf;
++    PRInt32 bytes, j, rv;
++    PRInt32 stream=0;
++    PRInt32 msg_flags=0;
++    PRSocketOptionData sod;
++
++    sockfd = scp->sockfd;
++    bytes = scp->datalen;
++    in_buf = PR_NEW(buffer);
++    if (in_buf == NULL) {
++        fprintf(stderr,"prsctp_test: SCTP_Serve_Client: failed to alloc buffer struct\n");
++        failed_already=1;
++        goto exit;
++    }
++
++    /*
++     * Subscribe to sctp_data_io_event.
++     */
++    memset(&sod, 0, sizeof(sod));
++    sod.option = PR_SockOpt_Events;
++    sod.value.events.sctp_data_io_event = 1;
++    if (PR_SetSocketOption(sockfd, &sod) != PR_SUCCESS) {
++        fprintf(stderr, "prsctp_test: SCTP_Serve_Client: Set PR_SockOpt_Events failed.\n");
++        failed_already=1;
++        goto exit;
++    }
++
++    for (j = 0; j < num_sctp_mesgs_per_connection; j++) {
++        /*
++         * Read data from client and send it back to the client unmodified
++         */
++        msg_flags = 0;
++
++        rv = readn(sockfd, in_buf->data, bytes, &stream, &msg_flags);
++        if (rv < bytes) {
++            failed_already=1;
++            goto exit;
++        }
++        /*
++         * As currently setup, this test should never return with MSG_NOTIFICATION
++         * or without MSG_EOR
++         */
++        if (!(msg_flags & MSG_EOR) || msg_flags & MSG_NOTIFICATION)
++            fprintf(stderr, "readn returned %s MSG_EOR and %s MSG_NOTIFICATION\n",
++                    (msg_flags & MSG_EOR ? "with" : "without"),
++                    (msg_flags & MSG_NOTIFICATION ? "with" : "without"));
++        /*
++         * shutdown reads, after the last read
++         */
++        if (j == num_sctp_mesgs_per_connection - 1)
++            if (PR_Shutdown(sockfd, PR_SHUTDOWN_RCV) < 0) {
++                fprintf(stderr,"prsocket_test: SCTP_Serve_Client: ERROR - PR_SHUTDOWN_RCV\n");
++            }
++        printf("Serve_Client [0x%p]: inbuf[0] = 0x%d\n",PR_GetCurrentThread(),
++            (*((int *) in_buf->data)));
++        if (PR_SctpSendmsg(sockfd, in_buf->data, bytes, NULL, 0, 0, 0,
++                           stream, 0, 0, PR_INTERVAL_NO_TIMEOUT) < 0) {
++            fprintf(stderr,"prsocket_test: SCTP_Serve_Client: ERROR - PR_SctpSendmsg\n");
++            failed_already=1;
++            goto exit;
++        }
++    }
++    /*
++     * shutdown reads and writes
++     */
++    errno = 0;
++    if (PR_Shutdown(sockfd, PR_SHUTDOWN_BOTH) < 0) {
++        fprintf(stderr,"prsocket_test: SCTP_Serve_Client: ERROR - PR_SHUTDOWN_BOTH\n");
++        failed_already=1;
++    }
++
++exit:
++    PR_Close(sockfd);
++    if (in_buf) {
++        PR_DELETE(in_buf);
++    }
++}
++
++PRThread* create_new_thread(PRThreadType      type,
++                            void              (*start)(void *arg),
++                            void             *arg,
++                            PRThreadPriority  priority,
++                            PRThreadScope     scope,
++                            PRThreadState     state,
++                            PRUint32          stackSize,
++                            PRInt32           index)
++{
++PRInt32 native_thread = 0;
++
++	PR_ASSERT(state == PR_UNJOINABLE_THREAD);
++#if (defined(_PR_PTHREADS) && !defined(_PR_DCETHREADS)) || defined(WIN32)
++	switch(index %  4) {
++		case 0:
++			scope = (PR_LOCAL_THREAD);
++			break;
++		case 1:
++			scope = (PR_GLOBAL_THREAD);
++			break;
++		case 2:
++			scope = (PR_GLOBAL_BOUND_THREAD);
++			break;
++		case 3:
++			native_thread = 1;
++			break;
++		default:
++			PR_ASSERT(!"Invalid scope");
++			break;
++	}
++	if (native_thread) {
++#if defined(_PR_PTHREADS) && !defined(_PR_DCETHREADS)
++		pthread_t *tid = malloc(sizeof(pthread_t));;
++		if (!pthread_create(tid, NULL, (void * (*)(void *)) start, arg))
++			return((PRThread *) tid);
++		else
++			return (NULL);
++#else
++		HANDLE thandle;
++		unsigned tid;
++		
++		thandle = (HANDLE) _beginthreadex(
++						NULL,
++						stackSize,
++						(unsigned (__stdcall *)(void *))start,
++						arg,
++						0,
++						&tid);		
++		return((PRThread *) thandle);
++#endif
++	} else {
++		return(PR_CreateThread(type,start,arg,priority,scope,state,stackSize));
++	}
++#else
++	return(PR_CreateThread(type,start,arg,priority,scope,state,stackSize));
++#endif
++}
++
++/*
++ * SCTP Server
++ *    Server Thread
++ *    Bind an address to a socket and listen for incoming connections
++ *    Start a Serve_Client thread for each incoming connection.
++ */
++static void PR_CALLBACK
++SCTP_Server(void *arg)
++{
++    PRThread *t;
++    Server_Param *sp = (Server_Param *) arg;
++    Serve_Client_Param *scp;
++    PRFileDesc *sockfd, *newsockfd;
++    PRNetAddr netaddr;
++    PRInt32 i;
++    PRSocketOptionData sod;
++
++   /*
++    * Create an SCTP socket
++    */
++    if ((sockfd = PR_OpenSCTPOneToOneSocket(server_domain)) == NULL) {
++        fprintf(stderr,"prsocket_test: PR_OpenSCTPOneToOneSocket failed\n");
++        goto exit;
++    }
++    memset(&netaddr, 0 , sizeof(netaddr));
++
++    if (PR_SetNetAddr(PR_IpAddrAny, server_domain, SCTP_SERVER_PORT,
++                                                            &netaddr) == PR_FAILURE) {
++        fprintf(stderr,"prsocket_test: PR_SetNetAddr failed\n");
++        goto exit;
++    }
++   /*
++    * try a few times to bind server's address, if addresses are in use
++    */
++    i = 0;
++
++    while (PR_Bind(sockfd, &netaddr) < 0) {
++        if (PR_GetError() == PR_ADDRESS_IN_USE_ERROR) {
++            netaddr.inet.port += 2;
++            if (i++ < SERVER_MAX_BIND_COUNT)
++            continue;
++        }
++        fprintf(stderr,"prsocket_test: ERROR - PR_Bind failed\n");
++        perror("PR_Bind");
++        failed_already=1;
++        goto exit;
++    }
++
++       /*
++        * Set SCTP_NODELAY
++        */
++        memset(&sod, 0, sizeof(sod));
++        sod.option = PR_SockOpt_SctpNoDelay;
++        sod.value.sctp_nodelay = 1;
++        if (PR_SetSocketOption(sockfd, &sod) != PR_SUCCESS) {
++            fprintf(stderr, "prsctp_test: SCTP_Server: Set PR_SockOpt_SctpNoDelay failed.\n");
++            failed_already=1;
++            return;
++        }
++
++    if (PR_Listen(sockfd, 32) < 0) {
++        fprintf(stderr,"prsctp_test: SCTP_Server: ERROR - PR_Listen failed\n");
++        failed_already=1;
++        goto exit;
++    }
++
++    if (PR_GetSockName(sockfd, &netaddr) < 0) {
++        fprintf(stderr,"prsctp_test: SCTP_Server: ERROR - PR_GetSockName failed\n");
++        failed_already=1;
++        goto exit;
++    }
++
++    printf("SCTP_Server: PR_BIND netaddr.inet.ip = 0x%d, netaddr.inet.port = %d\n",
++        netaddr.inet.ip, netaddr.inet.port);
++    if (PR_SetNetAddr(PR_IpAddrLoopback, client_domain,
++                      PR_ntohs(PR_NetAddrInetPort(&netaddr)),
++                      &sctp_server_addr) == PR_FAILURE) {
++        fprintf(stderr,"prsctp_test: SCTP_Server: ERROR - PR_SetNetAddr failed\n");
++        goto exit;
++    }
++    if ((client_domain == PR_AF_INET6) && (server_domain == PR_AF_INET))
++        PR_ConvertIPv4AddrToIPv6(PR_htonl(INADDR_LOOPBACK),
++                                 &sctp_server_addr.ipv6.ip);
++
++   /*
++    * Wake up parent thread because server address is bound and made
++    * available in the global variable 'sctp_server_addr'
++    */
++    PR_Lock(sp->serv_lock);
++    PR_NotifyCondVar(sp->serv_cond);
++    PR_Unlock(sp->serv_lock);
++
++    for (i = 0; i < (num_sctp_clients * num_sctp_connections_per_client); i++) {
++        /* test both null and non-null 'addr' argument to PR_Accept */
++        PRNetAddr *addrp = (i%2 ? &netaddr: NULL);
++
++    printf("SCTP_Server: Accepting connection\n");
++        if ((newsockfd = PR_Accept(sockfd, addrp,
++            PR_INTERVAL_NO_TIMEOUT)) == NULL) {
++            fprintf(stderr,"prsocket_test: SCTP_Server: ERROR - PR_Accept failed\n");
++            goto exit;
++        }
++    printf("SCTP_Server: Accepted connection\n");
++        scp = PR_NEW(Serve_Client_Param);
++        if (scp == NULL) {
++            fprintf(stderr,"prsocket_test: SCTP_Server: ERROR - PR_NEW failed\n");
++            goto exit;
++        }
++
++        /*
++         * Start a Serve_Client thread for each incoming connection
++         */
++        scp->sockfd = newsockfd;
++        scp->datalen = sp->datalen;
++
++        t = create_new_thread(PR_USER_THREAD,
++            SCTP_Serve_Client, (void *)scp, 
++            PR_PRIORITY_NORMAL,
++            PR_LOCAL_THREAD,
++            PR_UNJOINABLE_THREAD,
++            0, i);
++        if (t == NULL) {
++            fprintf(stderr,"prsocket_test: SCPT_Server: ERROR - PR_CreateThread failed\n");
++            failed_already=1;
++            goto exit;
++        }
++        printf("SCTP_Server: Created Serve_Client = 0x%p\n", t);
++    }
++
++exit:
++    if (sockfd) {
++        PR_Close(sockfd);
++    }
++
++    /*
++     * Decrement exit_counter and notify parent thread
++     */
++
++    PR_EnterMonitor(sp->exit_mon);
++    --(*sp->exit_counter);
++    PR_Notify(sp->exit_mon);
++    PR_ExitMonitor(sp->exit_mon);
++    printf("SCTP_Server [0x%p] exiting\n", PR_GetCurrentThread());
++}
++
++/*
++ * SCTP_Client
++ *    Client Thread
++ *    Connect to the server at the address specified in the argument.
++ *    Fill in a buffer, write data to server, read it back and check
++ *    for data corruption.
++ *    Close the socket for server connection
++ */
++static void PR_CALLBACK
++SCTP_Client(void *arg)
++{
++    Client_Param *cp = (Client_Param *) arg;
++    PRFileDesc *sockfd;
++    buffer *in_buf, *out_buf;
++    union PRNetAddr netaddr;
++    PRInt32 bytes, i, j;
++    PRInt32 stream;
++    PRInt32 msg_flags=0;
++    int rv;
++    PRSocketOptionData sod;
++
++    bytes = cp->datalen;
++    out_buf = PR_NEW(buffer);
++    if (out_buf == NULL) {
++        fprintf(stderr,"prsocket_test: failed to alloc buffer struct\n");
++        failed_already=1;
++        return;
++    }
++    in_buf = PR_NEW(buffer);
++    if (in_buf == NULL) {
++        fprintf(stderr,"prsocket_test: failed to alloc buffer struct\n");
++        failed_already=1;
++        return;
++    }
++    netaddr = cp->server_addr;
++
++   /*
++    * Open all connections
++    */
++    for (i = 0; i < num_sctp_connections_per_client; i++) {
++        if ((sockfd = PR_OpenSCTPOneToOneSocket(client_domain)) == NULL) {
++            fprintf(stderr,"prsocket_test: PR_OpenSCTPOneToOneSocket failed\n");
++            failed_already=1;
++            return;
++        }
++
++       /*
++        * Set SCTP_NODELAY
++        */
++        memset(&sod, 0, sizeof(sod));
++        sod.option = PR_SockOpt_SctpNoDelay;
++        sod.value.sctp_nodelay = 1;
++        if (PR_SetSocketOption(sockfd, &sod) != PR_SUCCESS) {
++            fprintf(stderr, "SCTP_Client: Set PR_SockOpt_SctpNoDelay failed.\n");
++            failed_already=1;
++            return;
++        }
++
++       /*
++        * subscribe to the sctp_data_io_event
++        */
++        memset(&sod, 0, sizeof(sod));
++        sod.option = PR_SockOpt_Events;
++        sod.value.events.sctp_data_io_event = 1;
++        if (PR_SetSocketOption(sockfd, &sod) != PR_SUCCESS) {
++            fprintf(stderr, "SCTP_Client: Set PR_SockOpt_Events failed.\n");
++            failed_already=1;
++            return;
++        }
++
++       /*
++        * Request NUM_SCTP_STREAMS outgoing streams
++        */
++        memset(&sod, 0, sizeof(sod));
++        sod.option = PR_SockOpt_InitMsg;
++        if (PR_GetSocketOption(sockfd, &sod) != PR_SUCCESS) {
++            fprintf(stderr, "SCTP_Client: Get PR_SockOpt_InitMsg failed.\n");
++            failed_already=1;
++            return;
++        }
++        sod.value.initmsg.sinit_num_ostreams = NUM_SCTP_STREAMS;
++        if (PR_SetSocketOption(sockfd, &sod) != PR_SUCCESS) {
++            fprintf(stderr, "SCTP_Client: Set PR_SockOpt_InitMsg failed.\n");
++            failed_already=1;
++            return; 	
++        }
++
++       /*
++        * Connect to server
++        */
++        if (PR_Connect(sockfd, &netaddr,PR_INTERVAL_NO_TIMEOUT) < 0){
++        	fprintf(stderr, "PR_Connect failed: (%d, %d)\n",
++            		PR_GetError(), PR_GetOSError());
++            failed_already=1;
++            return;
++        }
++
++       /*
++        * Check number of outgoing streams
++        */
++        memset(&sod, 0, sizeof(sod));
++        sod.option = PR_SockOpt_Status;
++        if (PR_GetSocketOption(sockfd, &sod) != PR_SUCCESS) {
++            fprintf(stderr, "prsctp_test: SCTP_Serve_Client: Get PR_SockOpt_Status failed.\n");
++            failed_already=1;
++            return;
++        }
++        if (NUM_SCTP_STREAMS != sod.value.status.sstat_outstrms)
++            fprintf(stderr, "prsctp_test: SCTP_Serve_Client: Number of outgoing streams different from request.\n");
++
++       /*
++        * Send and receive all messages for this connection
++        */
++        for (j = 0; j < num_sctp_mesgs_per_connection; j++) {
++           /*
++            * fill in random data
++            */
++            memset(out_buf->data, ((PRInt32*) (&netaddr)) + i + j, bytes);
++           /*
++            * write to server
++            */
++            stream = j % NUM_SCTP_STREAMS;
++            if (PR_SctpSendmsg(sockfd, out_buf->data, bytes, NULL, 0, 0, 0,
++                               stream, 0, 0, PR_INTERVAL_NO_TIMEOUT) < 0) {
++                fprintf(stderr,"prsctp_test: SCTP_Client: ERROR - PR_SctpSendmsg\n");
++                failed_already=1;
++                return;
++            }
++            printf("SCTP Client [0x%p]: out_buf = 0x%p out_buf[0] = 0x%x\n",
++                PR_GetCurrentThread(), out_buf, (*((int *) out_buf->data)));
++
++            msg_flags = 0;
++            rv = readn(sockfd, in_buf->data, bytes, &stream, &msg_flags);
++            if (rv < bytes) {
++                failed_already=1;
++                return;
++            }
++           /*
++            * As currently setup, this test should never return with MSG_NOTIFICATION
++            * or without MSG_EOR
++            */
++            if (!(msg_flags & MSG_EOR) || msg_flags & MSG_NOTIFICATION)
++                fprintf(stderr, "readn returned %s MSG_EOR and %s MSG_NOTIFICATION\n",
++                        (msg_flags & MSG_EOR ? "with" : "without"),
++                        (msg_flags & MSG_NOTIFICATION ? "with" : "without"));
++           /*
++            * verify the stream number
++            */
++            if (stream != j) {
++                fprintf(stderr, "prsctp_test: SCTP_Client: ERROR - response not received on expected stream number.\n");
++                failed_already=1;
++                return;
++            }
++           /*
++            * verify the data read
++            */
++            if (memcmp(in_buf->data, out_buf->data, bytes) != 0) {
++                fprintf(stderr,"prsctpt_test: SCTP_Client: ERROR - data corruption\n");
++                failed_already=1;
++                return;
++            }
++        }
++        /*
++         * shutdown reads and writes
++         */
++        if (PR_Shutdown(sockfd, PR_SHUTDOWN_BOTH) < 0) {
++            fprintf(stderr,"prsctp_test: SCTP_Client: ERROR - PR_SHUTDOWN_BOTH\n");
++            failed_already=1;
++        }
++        PR_Close(sockfd);
++    }
++
++    PR_DELETE(out_buf);
++    PR_DELETE(in_buf);
++
++    /*
++     * Decrement exit_counter and notify parent thread
++     */
++    PR_EnterMonitor(cp->exit_mon);
++    --(*cp->exit_counter);
++    PR_Notify(cp->exit_mon);
++    PR_ExitMonitor(cp->exit_mon);
++    printf("SCTP_Client [0x%p] exiting\n", PR_GetCurrentThread());
++}
++
++/*
++ * SCTP_Socket_Client_Server_Test    - concurrent server test
++ *    
++ *    One server and several clients are started
++ *    Each client connects to the server and sends a chunk of data
++ *    For each connection, server starts another thread to read the data
++ *    from the client and send it back to the client, unmodified.
++ *    Each client checks that data received from server is same as the
++ *    data it sent to the server.
++ *
++ */
++
++static PRInt32
++SCTP_Socket_Client_Server_Test(void)
++{
++    int i;
++    PRThread *t;
++    Server_Param *sparamp;
++    Client_Param *cparamp;
++    PRMonitor *mon2;
++    PRInt32    datalen;
++    PRLock *server_lock;
++    PRCondVar *server_up;
++
++    datalen = sctp_mesg_size;
++    thread_count = 0;
++    /*
++     * start the server thread
++     */
++    sparamp = PR_NEW(Server_Param);
++    if (sparamp == NULL) {
++        fprintf(stderr,"prsocket_test: SCTP_Socket_Client_Server_Test: ERROR - PR_NEW failed\n");
++        failed_already=1;
++        return -1;
++    }
++    mon2 = PR_NewMonitor();
++    if (mon2 == NULL) {
++        fprintf(stderr,"prsocket_test: SCTP_Socket_Client_Server_Test: ERROR - PR_NewMonitor failed\n");
++        failed_already=1;
++        return -1;
++    }
++    PR_EnterMonitor(mon2);
++
++    /* server_lock controls access to server_up condition variable */
++    server_lock = PR_NewLock();
++    if (server_lock == NULL) {
++        fprintf(stderr,"prsocket_test: SCTP_Socket_Client_Server_Test: ERROR - PR_NewLock failed\n");
++        failed_already=1;
++        return -1;
++    }
++    /* server_up is notified when server address is available */
++    server_up = PR_NewCondVar(server_lock);
++    if (server_up == NULL) {
++        fprintf(stderr,"prsocket_test: SCTP_Socket_Client_Server_Test: ERROR - PR_NewCondVar failed\n");
++        failed_already=1;
++        return -1;
++    }
++
++    PR_Lock(server_lock);
++
++    /* sparamp->addr_sem = server_sem; */
++    sparamp->exit_mon = mon2;
++    sparamp->exit_counter = &thread_count;
++    sparamp->datalen = datalen;
++    sparamp->serv_lock = server_lock;
++    sparamp->serv_cond = server_up;
++    t = PR_CreateThread(PR_USER_THREAD,
++        SCTP_Server, (void *)sparamp, 
++        PR_PRIORITY_NORMAL,
++        PR_LOCAL_THREAD,
++        PR_UNJOINABLE_THREAD,
++        0);
++    if (t == NULL) {
++        fprintf(stderr,"prsocket_test: SCTP_Socket_Client_Server_Test: ERROR - PR_CreateThread failed\n");
++        failed_already=1;
++        return -1;
++    }
++    printf("Created SCTP_Server = 0x%p\n", t);
++    thread_count++;
++
++    /* wait for server to notify that address is available */
++    PR_WaitCondVar(server_up, PR_INTERVAL_NO_TIMEOUT);
++
++    /* release lock and cleanup */
++    PR_Unlock(server_lock);
++    PR_DestroyCondVar(server_up);
++    PR_DestroyLock(server_lock);
++
++    /*
++     * Now start a bunch of client threads
++     */
++
++    cparamp = PR_NEW(Client_Param);
++    if (cparamp == NULL) {
++        fprintf(stderr,"prsocket_test: SCTP_Socket_Client_Server_Test: ERROR - PR_NEW failed\n");
++        failed_already=1;
++        return -1;
++    }
++    cparamp->server_addr = sctp_server_addr;
++    cparamp->exit_mon = mon2;
++    cparamp->exit_counter = &thread_count;
++    cparamp->datalen = datalen;
++    for (i = 0; i < num_sctp_clients; i++) {
++        t = create_new_thread(PR_USER_THREAD,
++            SCTP_Client, (void *) cparamp,
++            PR_PRIORITY_NORMAL,
++            PR_LOCAL_THREAD,
++            PR_UNJOINABLE_THREAD,
++            0, i);
++        if (t == NULL) {
++            fprintf(stderr,"prsocket_test: SCTP_Socket_Client_Server_Test: ERROR - PR_CreateThread failed\n");
++            failed_already=1;
++            return -1;
++        }
++        printf("Created SCTP_Client = 0x%p\n", t);
++        thread_count++;
++    }
++    /* Wait for server and client threads to exit */
++    while (thread_count) {
++        PR_Wait(mon2, PR_INTERVAL_NO_TIMEOUT);
++        printf("SCTP Server - thread_count  = %d\n", thread_count);
++    }
++    PR_ExitMonitor(mon2);
++    printf("%30s","SCTP_Socket_Client_Server_Test:");
++    printf("%2ld Server %2d Clients %2d connections_per_client\n",1l,
++        num_sctp_clients, num_sctp_connections_per_client);
++    printf("%30s %2d messages_per_connection %4d bytes_per_message\n",":",
++        num_sctp_mesgs_per_connection, sctp_mesg_size);
++
++    return 0;
++}
++
++/*
++ * Test Socket NSPR APIs
++ */
++ 	
++int main(int argc, char **argv)
++{
++    /*
++     * -d           debug mode
++     */
++
++    PLOptStatus os;
++    PLOptState *opt = PL_CreateOptState(argc, argv, "d");
++    while (PL_OPT_EOL != (os = PL_GetNextOpt(opt)))
++    {
++        if (PL_OPT_BAD == os) continue;
++        switch (opt->option)
++        {
++        case 'd':  /* debug mode */
++            _debug_on = 1;
++            break;
++        default:
++            break;
++        }
++    }
++    PL_DestroyOptState(opt);
++
++    PR_Init(PR_USER_THREAD, PR_PRIORITY_NORMAL, 0);
++    PR_STDIO_INIT();
++ 	
++    PR_SetConcurrency(4);
++
++    /*
++     * run client-server test with SCTP, Ipv4-Ipv4
++     */
++	printf("SCTP Client/Server Test - IPv4/Ipv4\n");
++    if (SCTP_Socket_Client_Server_Test() < 0) {
++        printf("SCTP_Socket_Client_Server_Test failed\n");
++        goto done;
++    } else
++        printf("SCTP_Socket_Client_Server_Test Passed\n");
++
++done:
++    PR_Cleanup();
++    if (failed_already) return 1;
++    else return 0;
++}
+

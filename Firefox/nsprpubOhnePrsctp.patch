@@ -1,0 +1,1710 @@
+diff --git a/configure.in b/configure.in
+--- a/configure.in
++++ b/configure.in
+@@ -2601,16 +2601,28 @@ MOZ_CHECK_COMMON_HEADERS
+ 
+ dnl These are all the places some variant of statfs can be hiding.
+ MOZ_CHECK_HEADERS(sys/statvfs.h sys/statfs.h sys/vfs.h sys/mount.h)
+ 
+ dnl Quota support
+ MOZ_CHECK_HEADERS(sys/quota.h sys/sysmacros.h)
+ MOZ_CHECK_HEADERS([linux/quota.h],,,[#include <sys/socket.h>])
+ 
++dnl enable SCTP
++MOZ_ARG_ENABLE_BOOL(sctp,
++[  --enable-sctp          Build with SCTP support enabled],
++    ENABLE_SCTP=1,
++    ENABLE_SCTP=)
++AC_MSG_CHECKING([whether SCTP is supported])
++if test -n "$ENABLE_SCTP"; then
++    AC_DEFINE(ENABLE_SCTP)
++fi
++
++AC_SUBST(ENABLE_SCTP)
++
+ dnl SCTP support - needs various network include headers
+ MOZ_CHECK_HEADERS([linux/if_addr.h linux/rtnetlink.h],,,[#include <sys/socket.h>])
+ MOZ_CHECK_HEADERS(sys/queue.h)
+ 
+ MOZ_CHECK_HEADERS(sys/types.h netinet/in.h byteswap.h)
+ 
+ dnl Check for sin_len and sin6_len - used by SCTP; only appears in Mac/*BSD generally
+ AC_CACHE_CHECK(for sockaddr_in.sin_len,
+diff --git a/media/mtransport/transportlayerdtls.cpp b/media/mtransport/transportlayerdtls.cpp
+--- a/media/mtransport/transportlayerdtls.cpp
++++ b/media/mtransport/transportlayerdtls.cpp
+@@ -273,16 +273,35 @@ static PRStatus TransportLayerGetpeernam
+   // elsewhere
+   addr->inet.family = PR_AF_INET;
+   addr->inet.port = 0;
+   addr->inet.ip = 0;
+ 
+   return PR_SUCCESS;
+ }
+ 
++#if defined(ENABLE_SCTP)
++static int32_t TransportLayerSctp_recvmsg(PRFileDesc *fd, void *buf,
++    PRInt32 amount, PRNetAddr *from, PRUint32 *fromlen,
++    PRSctp_SndRcvInfo *sinfo, PRInt32 *msgflags,
++    PRIntervalTime timeout) {
++    UNIMPLEMENTED;
++    return -1;
++}
++
++static int32_t TransportLayerSctp_sendmsg(PRFileDesc *fd, const void *buf,
++    PRInt32 amount, const PRNetAddr *to, PRUint32 tolen, PRInt32 ppid,
++    PRUint32 flags, PRInt16 stream, PRInt32 timetolive, PRInt32 context,
++    PRIntervalTime timeout)
++{
++    UNIMPLEMENTED;
++    return -1;
++}
++#endif
++
+ static PRStatus TransportLayerGetsockname(PRFileDesc *f, PRNetAddr *addr) {
+   UNIMPLEMENTED;
+   return PR_FAILURE;
+ }
+ 
+ static PRStatus TransportLayerGetsockoption(PRFileDesc *f, PRSocketOptionData *opt) {
+   switch (opt->option) {
+     case PR_SockOpt_Nonblocking:
+@@ -350,18 +369,23 @@ static const struct PRIOMethods Transpor
+   TransportLayerSend,
+   TransportLayerRecvfrom,
+   TransportLayerSendto,
+   TransportLayerPoll,
+   TransportLayerAcceptRead,
+   TransportLayerTransmitFile,
+   TransportLayerGetsockname,
+   TransportLayerGetpeername,
++#if defined(ENABLE_SCTP)
++  TransportLayerSctp_recvmsg,
++  TransportLayerSctp_sendmsg,
++#else
+   TransportLayerReserved,
+   TransportLayerReserved,
++#endif
+   TransportLayerGetsockoption,
+   TransportLayerSetsockoption,
+   TransportLayerSendfile,
+   TransportLayerConnectContinue,
+   TransportLayerReserved,
+   TransportLayerReserved,
+   TransportLayerReserved,
+   TransportLayerReserved
+diff --git a/nsprpub/config/autoconf.mk.in b/nsprpub/config/autoconf.mk.in
+--- a/nsprpub/config/autoconf.mk.in
++++ b/nsprpub/config/autoconf.mk.in
+@@ -115,16 +115,19 @@ PR_MD_ASFILES	= @PR_MD_ASFILES@
+ PR_MD_ARCH_DIR	= @PR_MD_ARCH_DIR@
+ CPU_ARCH	= @CPU_ARCH@
+ 
+ OS_TARGET	= @OS_TARGET@
+ OS_ARCH		= @OS_ARCH@
+ OS_RELEASE	= @OS_RELEASE@
+ OS_TEST		= @OS_TEST@
+ 
++ENABLE_SCTP     = @ENABLE_SCTP@
++USE_LIBSCTP     = @USE_LIBSCTP@
++
+ NOSUCHFILE	= @NOSUCHFILE@
+ AIX_LINK_OPTS	= @AIX_LINK_OPTS@
+ MOZ_OBJFORMAT	= @MOZ_OBJFORMAT@
+ ULTRASPARC_LIBRARY = @ULTRASPARC_LIBRARY@
+ 
+ OBJECT_MODE	= @OBJECT_MODE@
+ ifdef OBJECT_MODE
+ export OBJECT_MODE
+diff --git a/nsprpub/configure b/nsprpub/configure
+--- a/nsprpub/configure
++++ b/nsprpub/configure
+@@ -648,16 +648,18 @@ PROFILE_USE_LDFLAGS
+ PROFILE_USE_CFLAGS
+ PROFILE_GEN_LDFLAGS
+ PROFILE_GEN_CFLAGS
+ IMPLIB
+ FILTER
+ ASFLAGS
+ AR_FLAGS
+ DEFINES
++USE_LIBSCTP
++ENABLE_SCTP
+ MACOSX_DEPLOYMENT_TARGET
+ OS_TEST
+ OS_RELEASE
+ OS_ARCH
+ OS_TARGET
+ DSO_LDOPTS
+ DSO_CFLAGS
+ MKSHLIB
+@@ -815,16 +817,17 @@ with_soft_float
+ with_symbian_sdk
+ with_ccache
+ enable_strip
+ with_pthreads
+ enable_user_pthreads
+ enable_nspr_threads
+ with_bthreads
+ enable_ipv6
++enable_sctp
+ enable_wrap_malloc
+ with_wrap_malloc
+ '
+       ac_precious_vars='build_alias
+ host_alias
+ target_alias
+ CC
+ CFLAGS
+@@ -1466,16 +1469,17 @@ Optional Features:
+                           Set the minimum MacOS version needed at runtime
+                           10.2 for ppc, 10.4 for x86
+   --disable-os2-high-mem  Disable high-memory support on OS/2
+ 
+   --enable-strip          Enable stripping of shared libs and programs
+   --enable-user-pthreads  Build using userland pthreads
+   --enable-nspr-threads   Build using classic nspr threads
+   --enable-ipv6           Compile ipv6 support
++  --enable-sctp           Build with SCTP support enabled
+   --enable-wrap-malloc    Wrap malloc calls (gnu linker only)
+ 
+ Optional Packages:
+   --with-PACKAGE[=ARG]    use PACKAGE [ARG=yes]
+   --without-PACKAGE       do not use PACKAGE (same as --with-PACKAGE=no)
+   --with-android-ndk=DIR
+                           location where the Android NDK can be found
+   --with-android-toolchain=DIR
+@@ -2495,16 +2499,19 @@ NSPR_MODNAME=nspr20
+ USE_PTHREADS=
+ USE_USER_PTHREADS=
+ USE_NSPR_THREADS=
+ USE_N32=
+ USE_X32=
+ USE_64=
+ USE_CPLUS=
+ USE_IPV6=
++USE_LIBSCTP=
++_HAVE_SCTP=
++ENABLE_SCTP=
+ USE_MDUPDATE=
+ _MACOSX_DEPLOYMENT_TARGET=
+ _OPTIMIZE_FLAGS=-O
+ _DEBUG_FLAGS=-g
+ MOZ_DEBUG=1
+ MOZ_OPTIMIZE=
+ OBJDIR='$(OBJDIR_NAME)'
+ OBJDIR_NAME=.
+@@ -8519,16 +8526,171 @@ case "$target" in
+         $as_echo "#define _PR_HAVE_GETHOST_R_POINTER 1" >>confdefs.h
+ 
+     fi
+     ;;
+ esac
+ 
+ OS_LIBS="$_PTHREAD_LDFLAGS $OS_LIBS"
+ 
++
++
++
++# Check whether --enable-sctp was given.
++if test "${enable_sctp+set}" = set; then :
++  enableval=$enable_sctp;  if test "$enableval" = "yes"; then
++          for ac_header in sys/types.h
++do :
++  ac_fn_c_check_header_mongrel "$LINENO" "sys/types.h" "ac_cv_header_sys_types_h" "$ac_includes_default"
++if test "x$ac_cv_header_sys_types_h" = xyes; then :
++  cat >>confdefs.h <<_ACEOF
++#define HAVE_SYS_TYPES_H 1
++_ACEOF
++
++fi
++
++done
++
++          for ac_header in sys/socket.h
++do :
++  ac_fn_c_check_header_mongrel "$LINENO" "sys/socket.h" "ac_cv_header_sys_socket_h" "$ac_includes_default"
++if test "x$ac_cv_header_sys_socket_h" = xyes; then :
++  cat >>confdefs.h <<_ACEOF
++#define HAVE_SYS_SOCKET_H 1
++_ACEOF
++
++fi
++
++done
++
++          for ac_header in netinet/in.h
++do :
++  ac_fn_c_check_header_mongrel "$LINENO" "netinet/in.h" "ac_cv_header_netinet_in_h" "$ac_includes_default"
++if test "x$ac_cv_header_netinet_in_h" = xyes; then :
++  cat >>confdefs.h <<_ACEOF
++#define HAVE_NETINET_IN_H 1
++_ACEOF
++
++fi
++
++done
++
++          for ac_header in netinet/sctp.h
++do :
++  ac_fn_c_check_header_mongrel "$LINENO" "netinet/sctp.h" "ac_cv_header_netinet_sctp_h" "$ac_includes_default"
++if test "x$ac_cv_header_netinet_sctp_h" = xyes; then :
++  cat >>confdefs.h <<_ACEOF
++#define HAVE_NETINET_SCTP_H 1
++_ACEOF
++
++fi
++
++done
++
++          for ac_header in netinet/sctp_uio.h
++do :
++  ac_fn_c_check_header_mongrel "$LINENO" "netinet/sctp_uio.h" "ac_cv_header_netinet_sctp_uio_h" "$ac_includes_default"
++if test "x$ac_cv_header_netinet_sctp_uio_h" = xyes; then :
++  cat >>confdefs.h <<_ACEOF
++#define HAVE_NETINET_SCTP_UIO_H 1
++_ACEOF
++
++fi
++
++done
++
++
++                    LDOPTS_SAVE=$LDOPTS
++          CFLAGS_SAVE=$CFLAGS
++
++                    case "$target" in
++          *-linux*)
++              USE_LIBSCTP=1
++              ;;
++          *)
++                            as_fn_error $? " --enable-sctp option not supported for this target system" "$LINENO" 5;
++              ;;
++          esac
++
++                    if test -n "$USE_LIBSCTP"; then
++              LDOPTS="$LDOPTS -lsctp"
++          fi
++
++  { $as_echo "$as_me:${as_lineno-$LINENO}: checking whether SCTP is supported" >&5
++$as_echo_n "checking whether SCTP is supported... " >&6; }
++if ${nspr_cv_sctp+:} false; then :
++  $as_echo_n "(cached) " >&6
++else
++
++  if test "$cross_compiling" = yes; then :
++  nspr_cv_sctp=no
++else
++  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
++/* end confdefs.h.  */
++
++#ifdef HAVE_SYS_TYPES_H
++#include <sys/types.h>
++#endif
++#ifdef HAVE_SYS_SOCKET_H
++#include <sys/socket.h>
++#endif
++#ifdef HAVE_NETINET_IN_H
++#include <netinet/in.h>
++#endif
++#ifdef HAVE_NETINET_SCTP_H
++#include <netinet/sctp.h>
++#endif
++#ifdef HAVE_NETINET_SCTP_UIO_H
++#include <netinet/sctp_uio.h>
++#endif
++#include <stdlib.h>
++int main(void) {
++    int s, opt = 1;
++    if ((s = socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP)) < 0)
++       exit(1);
++    if (setsockopt(s, IPPROTO_SCTP, SCTP_NODELAY, &opt, sizeof(int)) < 0)
++       exit(2);
++    exit(0);
++}
++_ACEOF
++if ac_fn_c_try_run "$LINENO"; then :
++  nspr_cv_sctp=yes
++else
++  nspr_cv_sctp=no
++fi
++rm -f core *.core core.conftest.* gmon.out bb.out conftest$ac_exeext \
++  conftest.$ac_objext conftest.beam conftest.$ac_ext
++fi
++
++fi
++{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $nspr_cv_sctp" >&5
++$as_echo "$nspr_cv_sctp" >&6; }
++
++if test "$nspr_cv_sctp" = "yes"; then
++    _HAVE_SCTP=1
++fi
++
++
++          if test -n "$_HAVE_SCTP"; then
++              ENABLE_SCTP=1
++              $as_echo "#define ENABLE_SCTP 1" >>confdefs.h
++
++              if test -n "$USE_LIBSCTP"; then
++                  DSO_LDOPTS="$DSO_LDOPTS -lsctp"
++              fi
++          else
++              LDOPTS=$LDOPTS_SAVE
++              CFLAGS=$CFLAGS_SAVE
++              as_fn_error $? " --enable-sctp: system does not support SCTP " "$LINENO" 5;
++          fi
++      fi
++fi
++
++
++
+ if test -n "$_SAVE_OPTIMIZE_FLAGS"; then
+     _OPTIMIZE_FLAGS="$_SAVE_OPTIMIZE_FLAGS"
+ fi
+ 
+ if test -n "$_SAVE_DEBUG_FLAGS"; then
+     _DEBUG_FLAGS="$_SAVE_DEBUG_FLAGS"
+ fi
+ 
+@@ -8688,16 +8850,19 @@ fi
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
++
++
++
+ MAKEFILES="
+     Makefile
+     config/Makefile
+     config/autoconf.mk
+     config/nsprincl.mk
+     config/nsprincl.sh
+     config/nspr-config
+     config/nspr.pc
+diff --git a/nsprpub/configure.in b/nsprpub/configure.in
+--- a/nsprpub/configure.in
++++ b/nsprpub/configure.in
+@@ -22,16 +22,19 @@ NSPR_MODNAME=nspr20
+ USE_PTHREADS=
+ USE_USER_PTHREADS=
+ USE_NSPR_THREADS=
+ USE_N32=
+ USE_X32=
+ USE_64=
+ USE_CPLUS=
+ USE_IPV6=
++USE_LIBSCTP=
++_HAVE_SCTP=
++ENABLE_SCTP=
+ USE_MDUPDATE=
+ _MACOSX_DEPLOYMENT_TARGET=
+ _OPTIMIZE_FLAGS=-O
+ _DEBUG_FLAGS=-g
+ MOZ_DEBUG=1
+ MOZ_OPTIMIZE=
+ OBJDIR='$(OBJDIR_NAME)'
+ OBJDIR_NAME=.
+@@ -2920,16 +2923,106 @@ case "$target" in
+         AC_DEFINE(_PR_HAVE_GETHOST_R)
+         AC_DEFINE(_PR_HAVE_GETHOST_R_POINTER)
+     fi
+     ;;
+ esac
+ 
+ OS_LIBS="$_PTHREAD_LDFLAGS $OS_LIBS"
+ 
++dnl Support for SCTP
++dnl ========================================================
++dnl = --enable-sctp
++dnl = enable use of the sctp transport protocol
++dnl ========================================================
++dnl
++dnl NSPR_CHECK_SCTP
++dnl
++dnl check for presence of SCTP protocol support
++dnl
++
++AC_DEFUN([NSPR_CHECK_SCTP],
++[
++  AC_CACHE_CHECK([whether SCTP is supported], [nspr_cv_sctp], [
++  AC_TRY_RUN([
++#ifdef HAVE_SYS_TYPES_H
++#include <sys/types.h>
++#endif
++#ifdef HAVE_SYS_SOCKET_H
++#include <sys/socket.h>
++#endif
++#ifdef HAVE_NETINET_IN_H
++#include <netinet/in.h>
++#endif
++#ifdef HAVE_NETINET_SCTP_H
++#include <netinet/sctp.h>
++#endif
++#ifdef HAVE_NETINET_SCTP_UIO_H
++#include <netinet/sctp_uio.h>
++#endif
++#include <stdlib.h>
++int main(void) {
++    int s, opt = 1;
++    if ((s = socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP)) < 0)
++       exit(1);
++    if (setsockopt(s, IPPROTO_SCTP, SCTP_NODELAY, &opt, sizeof(int)) < 0)
++       exit(2);
++    exit(0);
++}], [nspr_cv_sctp=yes], [nspr_cv_sctp=no], [nspr_cv_sctp=no])])
++
++if test "$nspr_cv_sctp" = "yes"; then
++    _HAVE_SCTP=1
++fi
++])
++
++AC_ARG_ENABLE(sctp,
++    [  --enable-sctp           Build with SCTP support enabled],
++    [ if test "$enableval" = "yes"; then
++dnl          AC_CHECK_HEADERS([sys/types.h, sys/socket.h, netinet/in.h, netinet/sctp.h, netinet/sctp_uio.h])
++          AC_CHECK_HEADERS(sys/types.h)
++          AC_CHECK_HEADERS(sys/socket.h)
++          AC_CHECK_HEADERS(netinet/in.h)
++          AC_CHECK_HEADERS(netinet/sctp.h)
++          AC_CHECK_HEADERS(netinet/sctp_uio.h)
++
++          dnl - need to set LDOPTS or CFLAGS for NSPR_CHECK_SCTP, so save current value.
++          LDOPTS_SAVE=$LDOPTS
++          CFLAGS_SAVE=$CFLAGS
++
++          dnl - do OS based checks and configuration.
++          case "$target" in
++          *-linux*)
++              USE_LIBSCTP=1
++              ;;
++          *)
++              dnl - unknown system
++              AC_MSG_ERROR([ --enable-sctp option not supported for this target system]);
++              ;;
++          esac
++
++          dnl - check for SCTP support
++          if test -n "$USE_LIBSCTP"; then
++              LDOPTS="$LDOPTS -lsctp"
++          fi
++          NSPR_CHECK_SCTP
++
++          if test -n "$_HAVE_SCTP"; then
++              ENABLE_SCTP=1
++              AC_DEFINE(ENABLE_SCTP)
++              if test -n "$USE_LIBSCTP"; then
++                  DSO_LDOPTS="$DSO_LDOPTS -lsctp"
++              fi
++          else
++              LDOPTS=$LDOPTS_SAVE
++              CFLAGS=$CFLAGS_SAVE
++              AC_MSG_ERROR([ --enable-sctp: system does not support SCTP ]);
++          fi
++      fi])
++
++
+ dnl If the user passed in arg to --enable-optimize or --enable-debug,
+ dnl make sure that we use it.
+ if test -n "$_SAVE_OPTIMIZE_FLAGS"; then
+     _OPTIMIZE_FLAGS="$_SAVE_OPTIMIZE_FLAGS"
+ fi
+ 
+ if test -n "$_SAVE_DEBUG_FLAGS"; then
+     _DEBUG_FLAGS="$_SAVE_DEBUG_FLAGS"
+@@ -3055,16 +3148,19 @@ AC_SUBST(DSO_CFLAGS)
+ AC_SUBST(DSO_LDOPTS)
+ 
+ AC_SUBST(OS_TARGET)
+ AC_SUBST(OS_ARCH)
+ AC_SUBST(OS_RELEASE)
+ AC_SUBST(OS_TEST)
+ AC_SUBST(MACOSX_DEPLOYMENT_TARGET)
+ 
++AC_SUBST(ENABLE_SCTP)
++AC_SUBST(USE_LIBSCTP)
++
+ AC_SUBST(DEFINES)
+ AC_SUBST(DEFS)
+ AC_SUBST(AR)
+ AC_SUBST(AR_FLAGS)
+ AC_SUBST(AS)
+ AC_SUBST(ASFLAGS)
+ AC_SUBST(LD)
+ AC_SUBST(RANLIB)
+diff --git a/nsprpub/pr/include/md/_linux.h b/nsprpub/pr/include/md/_linux.h
+--- a/nsprpub/pr/include/md/_linux.h
++++ b/nsprpub/pr/include/md/_linux.h
+@@ -316,16 +316,27 @@ static inline PRInt32 _MD_ATOMIC_SET(PRI
+ #define _PR_HAVE_GETHOST_R_INT
+ #endif
+ 
+ #ifdef _PR_PTHREADS
+ 
+ extern void _MD_CleanupBeforeExit(void);
+ #define _MD_CLEANUP_BEFORE_EXIT _MD_CleanupBeforeExit
+ 
++#if defined(ENABLE_SCTP)
++extern int32_t _MD_Sctp_Recvmsg(int osfd, void *buf, int32_t amount,
++                                PRNetAddr *from, uint32_t *fromlen,
++                                PRSctp_SndRcvInfo *sinfo, int32_t *msg_flags);
++#define        _MD_SCTP_RECVMSG        _MD_Sctp_Recvmsg
++extern int32_t _MD_SCTPGetSocketOption(PRFileDesc *fd, PRSocketOptionData *data);
++#define _MD_SCTPGETSOCKETOPTION     _MD_SCTPGetSocketOption
++extern int32 _MD_SCTPSetSocketOption(PRFileDesc *fd, const PRSocketOptionData *data);
++#define _MD_SCTPSETSOCKETOPTION     _MD_SCTPSetSocketOption
++#endif /* ENABLE_SCTP */
++
+ #else  /* ! _PR_PTHREADS */
+ 
+ #include <setjmp.h>
+ 
+ #define PR_CONTEXT_TYPE	sigjmp_buf
+ 
+ #define CONTEXT(_th) ((_th)->md.context)
+ 
+diff --git a/nsprpub/pr/include/prio.h b/nsprpub/pr/include/prio.h
+--- a/nsprpub/pr/include/prio.h
++++ b/nsprpub/pr/include/prio.h
+@@ -176,16 +176,21 @@ union PRNetAddr {
+                                         /* bind fails if size is not 108. */
+ #else
+         char path[104];                 /* null-terminated pathname */
+ #endif
+     } local;
+ #endif
+ };
+ 
++#if defined(ENABLE_SCTP)
++/* PRNetAddr must be defined before including SCTP data structures. */
++#include "prsctp.h"
++#endif
++
+ /*
+ ***************************************************************************
+ ** PRSockOption
+ **
+ ** The file descriptors can have predefined options set after they file
+ ** descriptor is created to change their behavior. Only the options in
+ ** the following enumeration are supported.
+ ***************************************************************************
+@@ -208,16 +213,29 @@ typedef enum PRSockOption
+     PR_SockOpt_McastTimeToLive, /* multicast timetolive */
+     PR_SockOpt_McastLoopback,   /* multicast loopback */
+ 
+     PR_SockOpt_NoDelay,         /* don't delay send to coalesce packets */
+     PR_SockOpt_MaxSegment,      /* maximum segment size */
+     PR_SockOpt_Broadcast,       /* enable broadcast */
+     PR_SockOpt_Reuseport,       /* allow local address & port reuse on
+                                  * platforms that support it */
++#if defined(ENABLE_SCTP)
++   /* Adding socket options to support SCTP */
++    PR_SockOpt_DefaultSendParam,   /* set default outgoing parameter values */
++    PR_SockOpt_UseExtRcvInfo,      /* enable/disable extrcvinfo notifications */
++    PR_SockOpt_Events,             /* enable/disable sndrcvinfo notifications */
++    PR_SockOpt_InitMsg,            /* get/set INIT chunk parameters */
++    PR_SockOpt_AssocInfo,          /* get/set/change association info */
++    PR_SockOpt_SctpNoDelay,        /* enable/disable Nagle algorithm */
++    PR_SockOpt_SctpMaxSegment,     /* get/set maximum fragment size */
++    PR_SockOpt_Status,             /* get current state of association */
++    PR_SockOpt_SetPeerPrimaryAddr, /* set primary address of peer */
++    PR_SockOpt_SetPrimaryAddr,     /* set primary address */
++#endif
+     PR_SockOpt_Last
+ } PRSockOption;
+ 
+ typedef struct PRLinger {
+ 	PRBool polarity;		    /* Polarity of the option's setting */
+ 	PRIntervalTime linger;	    /* Time to linger before closing */
+ } PRLinger;
+ 
+@@ -244,16 +262,29 @@ typedef struct PRSocketOptionData
+         PRBool broadcast;           /* Enable broadcast */
+         PRSize max_segment;         /* Maximum segment size */
+         PRSize recv_buffer_size;    /* Receive buffer size */
+         PRSize send_buffer_size;    /* Send buffer size */
+         PRLinger linger;            /* Time to linger on close if data present */
+         PRMcastRequest add_member;  /* add an IP group membership */
+         PRMcastRequest drop_member; /* Drop an IP group membership */
+         PRNetAddr mcast_if;         /* multicast interface address */
++/* Adding union members to support SCTP socket options. */
++#if defined(ENABLE_SCTP)
++        PRSctp_SndRcvInfo sndrcvinfo;   /* set/get msg params/info */
++        PRBool useextrcvinfo;           /* enable/disable extrcvinfo messages */
++        PRSctp_Event_Subscribe events;  /* enable/disable sendrcvinfo messages */
++        PRSctp_InitMsg initmsg;         /* get/set INIT chunk parameters */
++        PRSctp_AssocParams assocparams; /* get/set/change association info */
++        PRBool sctp_nodelay;            /* enable/disable Nagle algorithm */
++        PRSctp_Assoc_Value sctp_maxseg; /* set/get max fragment size */
++        PRSctp_Status status;           /* get current state of association */
++        PRSctp_SetPeerPrim setpeerprim; /* set primary address of peer */
++        PRSctp_SetPrim setprim;         /* set primary address */
++#endif
+     } value;
+ } PRSocketOptionData;
+ 
+ /*
+ ***************************************************************************
+ ** PRIOVec
+ **
+ ** The I/O vector is used by the write vector method to describe the areas
+@@ -271,17 +302,18 @@ typedef struct PRIOVec {
+ ***************************************************************************
+ */
+ typedef enum PRDescType
+ {
+     PR_DESC_FILE = 1,
+     PR_DESC_SOCKET_TCP = 2,
+     PR_DESC_SOCKET_UDP = 3,
+     PR_DESC_LAYERED = 4,
+-    PR_DESC_PIPE = 5
++    PR_DESC_PIPE = 5,
++    PR_DESC_SOCKET_SCTP_ONE_TO_ONE = 6
+ } PRDescType;
+ 
+ typedef enum PRSeekWhence {
+     PR_SEEK_SET = 0,
+     PR_SEEK_CUR = 1,
+     PR_SEEK_END = 2
+ } PRSeekWhence;
+ 
+@@ -338,16 +370,25 @@ typedef PRInt32 (PR_CALLBACK *PRSendtoFN
+ typedef PRInt16 (PR_CALLBACK *PRPollFN)(
+     PRFileDesc *fd, PRInt16 in_flags, PRInt16 *out_flags);
+ typedef PRInt32 (PR_CALLBACK *PRAcceptreadFN)(
+     PRFileDesc *sd, PRFileDesc **nd, PRNetAddr **raddr,
+     void *buf, PRInt32 amount, PRIntervalTime t);
+ typedef PRInt32 (PR_CALLBACK *PRTransmitfileFN)(
+      PRFileDesc *sd, PRFileDesc *fd, const void *headers,
+      PRInt32 hlen, PRTransmitFileFlags flags, PRIntervalTime t);
++#if defined(ENABLE_SCTP)
++typedef PRInt32 (PR_CALLBACK *PRSctp_recvmsgFN)(
++    PRFileDesc *fd, void *msg, PRInt32 msgsz, PRNetAddr *from, PRUint32 *fromlen,
++    PRSctp_SndRcvInfo *sinfo, PRInt32 *msg_flags, PRIntervalTime timeout);
++typedef PRInt32 (PR_CALLBACK *PRSctp_sendmsgFN)(
++    PRFileDesc *fd, const void *msg, PRInt32 msgsz, const PRNetAddr *to, PRUint32 tolen,
++    PRInt32 ppid, PRUint32 flags, PRInt16 stream, PRInt32 timetolive, PRInt32 context,
++    PRIntervalTime timeout);
++#endif
+ typedef PRStatus (PR_CALLBACK *PRGetsocknameFN)(PRFileDesc *fd, PRNetAddr *addr);
+ typedef PRStatus (PR_CALLBACK *PRGetpeernameFN)(PRFileDesc *fd, PRNetAddr *addr);
+ typedef PRStatus (PR_CALLBACK *PRGetsocketoptionFN)(
+     PRFileDesc *fd, PRSocketOptionData *data);
+ typedef PRStatus (PR_CALLBACK *PRSetsocketoptionFN)(
+     PRFileDesc *fd, const PRSocketOptionData *data);
+ typedef PRInt32 (PR_CALLBACK *PRSendfileFN)(
+ 	PRFileDesc *networkSocket, PRSendFileData *sendData,
+@@ -378,18 +419,23 @@ struct PRIOMethods {
+     PRSendFN send;                  /* Send all the bytes specified             */
+     PRRecvfromFN recvfrom;          /* Solicit (net) bytes and report source    */
+     PRSendtoFN sendto;              /* Send bytes to (net) address specified    */
+     PRPollFN poll;                  /* Test the fd to see if it is ready        */
+     PRAcceptreadFN acceptread;      /* Accept and read on a new (net) fd        */
+     PRTransmitfileFN transmitfile;  /* Transmit at entire file                  */
+     PRGetsocknameFN getsockname;    /* Get (net) address associated with fd     */
+     PRGetpeernameFN getpeername;    /* Get peer's (net) address                 */
++#if defined(ENABLE_SCTP)
++    PRSctp_recvmsgFN sctp_recvmsg;  /* Receive the next message                 */
++    PRSctp_sendmsgFN sctp_sendmsg;  /* Send the specified bytes as a message    */
++#else
+     PRReservedFN reserved_fn_6;     /* reserved for future use */
+     PRReservedFN reserved_fn_5;     /* reserved for future use */
++#endif
+     PRGetsocketoptionFN getsocketoption;
+                                     /* Get current setting of specified option  */
+     PRSetsocketoptionFN setsocketoption;
+                                     /* Set value of specified option            */
+     PRSendfileFN sendfile;			/* Send a (partial) file with header/trailer*/
+     PRConnectcontinueFN connectcontinue;
+                                     /* Continue a nonblocking connect */
+     PRReservedFN reserved_fn_3;		/* reserved for future use */
+@@ -1223,16 +1269,58 @@ NSPR_API(PRFileDesc*)    PR_OpenUDPSocke
+  *     to the PRFileDesc created for the newly opened TCP socket.
+  *     Returns a NULL pointer if the creation of a new TCP socket failed.
+  *
+  **************************************************************************
+  */
+ 
+ NSPR_API(PRFileDesc*)    PR_OpenTCPSocket(PRIntn af);
+ 
++#if defined(ENABLE_SCTP)
++/*
++ *************************************************************************
++ * FUNCTION: PR_OpenSCTPSocket
++ * DESCRIPTION:
++ *     Create a new SCTP socket of the specified address family and type.
++ * INPUTS:
++ *     PRIntn af
++ *     Address family
++ *     PRInt32 type
++ *     Socket type
++ * OUTPUTS:
++ *     None
++ * RETURN: PRFileDesc*
++ *     Upon successful completion, PR_NewSCTPSocket returns a pointer
++ *     to the PRFileDesc created for the newly opened SCTP socket. 	
++ *     Returns a NULL pointer if the creation of a new SCTP socket failed.
++ *
++ **************************************************************************
++ */
++NSPR_API(PRFileDesc*)    PR_OpenSCTPSocket(PRIntn af, PRInt32 type);
++/*
++ *************************************************************************
++ * FUNCTION: PR_OpenSCTPOneToOneSocket
++ * DESCRIPTION:
++ *     Create a new SCTP 1-to-1 style socket of the specified address family.
++ * INPUTS:
++ *     PRIntn af
++ *       Address family
++ * OUTPUTS:
++ *     None
++ * RETURN: PRFileDesc*
++ *     Upon successful completion, PR_NewSCTPSocket returns a pointer
++ *     to the PRFileDesc created for the newly opened SCTP 1-to-1 style socket.
++ *     Returns a NULL pointer if the creation of a new SCTP socket failed.
++ *
++ **************************************************************************
++ */
++
++NSPR_API(PRFileDesc*)    PR_OpenSCTPOneToOneSocket(PRIntn af);
++#endif
++
+ /*
+  *************************************************************************
+  * FUNCTION: PR_Connect
+  * DESCRIPTION:
+  *     Initiate a connection on a socket.
+  * INPUTS:
+  *     PRFileDesc *fd
+  *       Points to a PRFileDesc object representing a socket
+@@ -1449,16 +1537,57 @@ NSPR_API(PRStatus)    PR_Shutdown(PRFile
+  **************************************************************************
+  */
+ 
+ #define PR_MSG_PEEK 0x2
+ 
+ NSPR_API(PRInt32)    PR_Recv(PRFileDesc *fd, void *buf, PRInt32 amount,
+                 PRIntn flags, PRIntervalTime timeout);
+ 
++#if defined(ENABLE_SCTP)
++ /*
++  *************************************************************************
++ * FUNCTION: PR_SctpRecvmsg
++ * DESCRIPTION:
++ *    Receive a specified number of bytes from a connected socket.
++ *     The operation will block until some positive number of bytes are
++ *     transferred, a time out has occurred, or there is an error.
++ *     No more than 'amount' bytes will be transferred.
++ * INPUTS:
++ *     PRFileDesc *fd
++ *       points to a PRFileDesc object representing a socket.
++ *     void *buf
++ *       pointer to a buffer to hold the data received.
++ *     PRInt32 msgsz
++ *       the size of 'buf' (in bytes)
++ *     PRNetAddr *from
++ *       points to sender's address
++ *     PRUint32 *fromlen
++ *       pointer to length of sender's address structure
++ *     PRSctp_SndRcvInfo *sinfo
++ *       points to send_receive info structure
++ *     PRInt32 *msgflags
++ *       points to message flags
++ * OUTPUTS:
++ *     None
++ * RETURN: PRInt32
++ *         a positive number indicates the number of bytes actually received.
++ *         0 means the network connection is closed.
++ *         -1 indicates a failure. The reason for the failure is obtained
++ *         by calling PR_GetError().
++ **************************************************************************
++ */
++
++NSPR_API(PRInt32)    PR_SctpRecvmsg(PRFileDesc *fd, void *buf,
++                PRInt32 msgsz, PRNetAddr *from, PRUint32 *fromlen,
++                PRSctp_SndRcvInfo *sinfo, PRInt32 *msgflags,
++                PRIntervalTime timeout);
++
++#endif
++
+ /*
+  *************************************************************************
+  * FUNCTION: PR_Send
+  * DESCRIPTION:
+  *    Send a specified number of bytes from a connected socket.
+  *     The operation will block until all bytes are 
+  *     processed, a time out has occurred, or there is an error. 
+  * INPUTS:
+@@ -1480,16 +1609,62 @@ NSPR_API(PRInt32)    PR_Recv(PRFileDesc 
+  *     operation failed. The reason for the failure is obtained by calling
+  *     PR_GetError().
+  **************************************************************************
+  */
+ 
+ NSPR_API(PRInt32)    PR_Send(PRFileDesc *fd, const void *buf, PRInt32 amount,
+                                 PRIntn flags, PRIntervalTime timeout);
+ 
++#if defined(ENABLE_SCTP)
++ /*
++  *************************************************************************
++ * FUNCTION: PR_SctpSendmsg
++ * DESCRIPTION:
++ *    Send a specified number of bytes from a connected socket.
++ *     The operation will block until all bytes are
++ *     processed, a time out has occurred, or there is an error.
++ * INPUTS:
++ *     PRFileDesc *fd
++ *       points to a PRFileDesc object representing a socket.
++ *     void *msg
++ *       pointer to a buffer containing the data
++ *     PRInt32 msgsz
++ *       the amount of data in msg (in bytes)
++ *     PRNetAddr *to
++ *        pointer to address of peer endpoint
++ *     PRUint32 tolen
++ *       length of peer endpoint address structure
++ *     PRInt32 ppid
++ *       payload protocol identifier to be passed to chunk
++ *     PRInt32 flags
++ *       flags to identify SCTP options
++ *     PRInt16 stream,
++ *       stream number on which to send data
++ *     PRInt32 timetolive
++ *       lifetime of message in milliseconds (0 = infinite lifetime)
++ *     PRInt32 context
++ *       user context to associate with local application-specific context
++ *       on failed transmission
++ * OUTPUTS:
++ *     None
++ * RETURN: PRInt32
++ *     A positive number indicates the number of bytes successfully processed.
++ *     This number must always equal 'amount'. A -1 is an indication that the
++ *     operation failed. The reason for the failure is obtained by calling
++ *     PR_GetError().
++ **************************************************************************
++ */
++
++NSPR_API(PRInt32)    PR_SctpSendmsg(PRFileDesc *fd, const void *buf,
++    PRInt32 msgsz, const PRNetAddr *to, PRUint32 tolen, PRInt32 ppid,
++    PRUint32 flags, PRInt16 stream, PRInt32 timetolive, PRInt32 context,
++    PRIntervalTime timeout);
++#endif
++
+ /*
+  *************************************************************************
+  * FUNCTION: PR_RecvFrom
+  * DESCRIPTION:
+  *     Receive up to a specified number of bytes from socket which may
+  *     or may not be connected.
+  *     The operation will block until one or more bytes are 
+  *     transferred, a time out has occurred, or there is an error. 
+diff --git a/nsprpub/pr/include/private/pprio.h b/nsprpub/pr/include/private/pprio.h
+--- a/nsprpub/pr/include/private/pprio.h
++++ b/nsprpub/pr/include/private/pprio.h
+@@ -26,16 +26,19 @@ typedef __int64 PROsfd;
+ typedef PRInt32 PROsfd;
+ #endif
+ 
+ /* Return the method tables for files, tcp sockets and udp sockets */
+ NSPR_API(const PRIOMethods*)    PR_GetFileMethods(void);
+ NSPR_API(const PRIOMethods*)    PR_GetTCPMethods(void);
+ NSPR_API(const PRIOMethods*)    PR_GetUDPMethods(void);
+ NSPR_API(const PRIOMethods*)    PR_GetPipeMethods(void);
++#if defined(ENABLE_SCTP)
++NSPR_API(const PRIOMethods*)    PR_GetSCTPOneToOneMethods(void);
++#endif
+ 
+ /*
+ ** Convert a NSPR socket handle to a native socket handle.
+ **
+ ** Using this function makes your code depend on the properties of the
+ ** current NSPR implementation, which may change (although extremely
+ ** unlikely because of NSPR's backward compatibility requirement).  Avoid
+ ** using it if you can.
+diff --git a/nsprpub/pr/include/private/primpl.h b/nsprpub/pr/include/private/primpl.h
+--- a/nsprpub/pr/include/private/primpl.h
++++ b/nsprpub/pr/include/private/primpl.h
+@@ -183,16 +183,30 @@ typedef struct PTDebug
+     PRUintn locks_created, locks_destroyed;
+     PRUintn locks_acquired, locks_released;
+     PRUintn cvars_created, cvars_destroyed;
+     PRUintn cvars_notified, delayed_cv_deletes;
+ } PTDebug;
+ 
+ #endif /* defined(DEBUG) */
+ 
++#if defined (ENABLE_SCTP)
++extern PRInt32 _PR_MD_SCTP_RECVMSG(int osfd, void *buf, PRInt32 amount,
++                                   PRNetAddr *from, PRUint32 *fromlen,
++                                   PRSctp_SndRcvInfo *sinfo,
++                                   PRInt32 *msg_flags);
++#define _PR_MD_SCTP_RECVMSG          _MD_SCTP_RECVMSG
++extern PRInt32 _PR_MD_SCTPGETSOCKETOPTION(PRFileDesc *fd,
++                                          PRSocketOptionData *data);
++#define _PR_MD_SCTPGETSOCKETOPTION   _MD_SCTPGETSOCKETOPTION
++extern PRInt32 _PR_MD_SCTPSETSOCKETOPTION(PRFileDesc *fd,
++                                          const PRSocketOptionData *data);
++#define _PR_MD_SCTPSETSOCKETOPTION   _MD_SCTPSETSOCKETOPTION
++#endif
++
+ NSPR_API(void) PT_FPrintStats(PRFileDesc *fd, const char *msg);
+ 
+ /*
+  * On Linux and its derivatives POSIX priority scheduling works only for
+  * real-time threads. On those platforms we set thread's nice values
+  * instead which requires us to track kernel thread IDs for each POSIX
+  * thread we create.
+  */
+diff --git a/nsprpub/pr/src/Makefile.in b/nsprpub/pr/src/Makefile.in
+--- a/nsprpub/pr/src/Makefile.in
++++ b/nsprpub/pr/src/Makefile.in
+@@ -178,16 +178,20 @@ endif
+ ifeq ($(OS_TARGET),Android)
+ OS_LIBS		+= -llog
+ endif
+ 
+ ifeq ($(OS_TARGET),MacOSX)
+ OS_LIBS		= -framework CoreServices -framework CoreFoundation
+ endif
+ 
++ifdef USE_LIBSCTP
++EXTRA_LIBS += -lsctp
++endif
++
+ EXTRA_LIBS += $(OS_LIBS)
+ 
+ #
+ # Define platform-dependent OBJS
+ #
+ 
+ OBJS = \
+     $(OBJDIR)/prvrsion.$(OBJ_SUFFIX) \
+diff --git a/nsprpub/pr/src/io/prfile.c b/nsprpub/pr/src/io/prfile.c
+--- a/nsprpub/pr/src/io/prfile.c
++++ b/nsprpub/pr/src/io/prfile.c
+@@ -241,19 +241,24 @@ static PRIOMethods _pr_fileMethods = {
+     (PRRecvFN)_PR_InvalidInt,		
+     (PRSendFN)_PR_InvalidInt,		
+     (PRRecvfromFN)_PR_InvalidInt,	
+     (PRSendtoFN)_PR_InvalidInt,		
+     FilePoll,         
+     (PRAcceptreadFN)_PR_InvalidInt,   
+     (PRTransmitfileFN)_PR_InvalidInt, 
+     (PRGetsocknameFN)_PR_InvalidStatus,	
+-    (PRGetpeernameFN)_PR_InvalidStatus,	
++    (PRGetpeernameFN)_PR_InvalidStatus,
++#if defined(ENABLE_SCTP)
++    (PRSctp_recvmsg) _PR_InvalidInt,
++    (PRSctp_sendmsg) _PR_InvalidInt,
++#else
+     (PRReservedFN)_PR_InvalidInt,	
+-    (PRReservedFN)_PR_InvalidInt,	
++    (PRReservedFN)_PR_InvalidInt,
++#endif	
+     (PRGetsocketoptionFN)_PR_InvalidStatus,	
+     (PRSetsocketoptionFN)_PR_InvalidStatus,
+     (PRSendfileFN)_PR_InvalidInt, 
+     (PRConnectcontinueFN)_PR_InvalidStatus, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt
+@@ -285,19 +290,24 @@ static PRIOMethods _pr_pipeMethods = {
+     (PRRecvFN)_PR_InvalidInt,		
+     (PRSendFN)_PR_InvalidInt,		
+     (PRRecvfromFN)_PR_InvalidInt,	
+     (PRSendtoFN)_PR_InvalidInt,		
+     FilePoll,         
+     (PRAcceptreadFN)_PR_InvalidInt,   
+     (PRTransmitfileFN)_PR_InvalidInt, 
+     (PRGetsocknameFN)_PR_InvalidStatus,	
+-    (PRGetpeernameFN)_PR_InvalidStatus,	
++    (PRGetpeernameFN)_PR_InvalidStatus,
++#if defined(ENABLE_SCTP)
++    (PRSctp_recvmsg) _PR_InvalidInt,		
++    (PRSctp_sendmsg) _PR_InvalidInt,
++#else
+     (PRReservedFN)_PR_InvalidInt,	
+-    (PRReservedFN)_PR_InvalidInt,	
++    (PRReservedFN)_PR_InvalidInt,
++#endif	
+     (PRGetsocketoptionFN)_PR_InvalidStatus,	
+     (PRSetsocketoptionFN)_PR_InvalidStatus,
+     (PRSendfileFN)_PR_InvalidInt, 
+     (PRConnectcontinueFN)_PR_InvalidStatus, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt
+diff --git a/nsprpub/pr/src/io/priometh.c b/nsprpub/pr/src/io/priometh.c
+--- a/nsprpub/pr/src/io/priometh.c
++++ b/nsprpub/pr/src/io/priometh.c
+@@ -31,19 +31,24 @@ PRIOMethods _pr_faulty_methods = {
+     (PRRecvFN)_PR_InvalidInt,        
+     (PRSendFN)_PR_InvalidInt,        
+     (PRRecvfromFN)_PR_InvalidInt,    
+     (PRSendtoFN)_PR_InvalidInt,        
+     (PRPollFN)_PR_InvalidInt16,
+     (PRAcceptreadFN)_PR_InvalidInt,   
+     (PRTransmitfileFN)_PR_InvalidInt, 
+     (PRGetsocknameFN)_PR_InvalidStatus,    
+-    (PRGetpeernameFN)_PR_InvalidStatus,    
++    (PRGetpeernameFN)_PR_InvalidStatus,
++#if defined(ENABLE_SCTP)
++    (PRSctp_recvmsgFN)_PR_InvalidInt,
++    (PRSctp_sendmsgFN)_PR_InvalidInt,
++#else   
+     (PRReservedFN)_PR_InvalidInt,    
+-    (PRReservedFN)_PR_InvalidInt,    
++    (PRReservedFN)_PR_InvalidInt,
++#endif   
+     (PRGetsocketoptionFN)_PR_InvalidStatus,
+     (PRSetsocketoptionFN)_PR_InvalidStatus,
+     (PRSendfileFN)_PR_InvalidInt, 
+     (PRConnectcontinueFN)_PR_InvalidStatus,
+     (PRReservedFN)_PR_InvalidInt,
+     (PRReservedFN)_PR_InvalidInt,
+     (PRReservedFN)_PR_InvalidInt,
+     (PRReservedFN)_PR_InvalidInt
+@@ -183,22 +188,39 @@ PR_IMPLEMENT(PRStatus) PR_Listen(PRFileD
+ }
+ 
+ PR_IMPLEMENT(PRInt32) PR_Recv(PRFileDesc *fd, void *buf, PRInt32 amount,
+ PRIntn flags, PRIntervalTime timeout)
+ {
+ 	return((fd->methods->recv)(fd,buf,amount,flags,timeout));
+ }
+ 
++#if defined(ENABLE_SCTP)
++PR_IMPLEMENT(PRInt32) PR_SctpRecvmsg(PRFileDesc *fd, void *msg, PRInt32 msgsz,
++    PRNetAddr *from, PRUint32 *fromlen, PRSctp_SndRcvInfo *sinfo, PRInt32 *msg_flags, PRIntervalTime timeout)
++{
++        return((fd->methods->sctp_recvmsg)(fd,msg,msgsz,from,fromlen,sinfo,msg_flags, timeout));
++}
++#endif
++
+ PR_IMPLEMENT(PRInt32) PR_Send(PRFileDesc *fd, const void *buf, PRInt32 amount,
+ PRIntn flags, PRIntervalTime timeout)
+ {
+ 	return((fd->methods->send)(fd,buf,amount,flags,timeout));
+ }
+ 
++#if defined(ENABLE_SCTP)
++PR_IMPLEMENT(PRInt32) PR_SctpSendmsg(PRFileDesc *fd, const void *msg, PRInt32 msgsz,
++    const PRNetAddr *to, PRUint32 tolen, PRInt32 ppid, PRUint32 flags, PRInt16 stream,
++    PRInt32 timetolive, PRInt32 context, PRIntervalTime timeout)
++{
++        return((fd->methods->sctp_sendmsg)(fd,msg,msgsz,to,tolen,ppid,flags,stream,timetolive,context,PR_INTERVAL_NO_TIMEOUT));
++}
++#endif
++
+ PR_IMPLEMENT(PRInt32) PR_Writev(PRFileDesc *fd, const PRIOVec *iov,
+ PRInt32 iov_size, PRIntervalTime timeout)
+ {
+     if (iov_size > PR_MAX_IOVECTOR_SIZE)
+     {
+         PR_SetError(PR_BUFFER_OVERFLOW_ERROR, 0);
+         return -1;
+     }
+diff --git a/nsprpub/pr/src/io/prlayer.c b/nsprpub/pr/src/io/prlayer.c
+--- a/nsprpub/pr/src/io/prlayer.c
++++ b/nsprpub/pr/src/io/prlayer.c
+@@ -356,16 +356,44 @@ static PRStatus PR_CALLBACK pl_DefGetsoc
+ static PRStatus PR_CALLBACK pl_DefGetpeername (PRFileDesc *fd, PRNetAddr *addr)
+ {
+     PR_ASSERT(fd != NULL);
+     PR_ASSERT(fd->lower != NULL);
+ 
+     return (fd->lower->methods->getpeername)(fd->lower, addr);
+ }
+ 
++#if defined(ENABLE_SCTP)
++static PRInt32 PR_CALLBACK pl_DefSctp_recvmsg (
++    PRFileDesc *fd, void *buf,
++    PRInt32 amount, PRNetAddr *from, PRUint32 *fromlen,
++    PRSctp_SndRcvInfo *sinfo, PRInt32 *msgflags,
++    PRIntervalTime timeout)
++{
++    PR_ASSERT(fd != NULL);
++    PR_ASSERT(fd->lower != NULL);
++
++    return (fd->lower->methods->sctp_recvmsg)(
++        fd->lower, buf, amount, from, fromlen, sinfo, msgflags, timeout);
++}
++
++static PRInt32 PR_CALLBACK pl_DefSctp_sendmsg (
++    PRFileDesc *fd, const void *buf,
++    PRInt32 amount, const PRNetAddr *to, PRUint32 tolen, PRInt32 ppid,
++    PRUint32 flags, PRInt16 stream, PRInt32 timetolive, PRInt32 context,
++    PRIntervalTime timeout)
++{
++    PR_ASSERT(fd != NULL);
++    PR_ASSERT(fd->lower != NULL);
++    return (fd->lower->methods->sctp_sendmsg)(
++        fd->lower, buf, amount, to, tolen, ppid, flags, stream, timetolive,
++        context, timeout);
++}
++#endif
++
+ static PRStatus PR_CALLBACK pl_DefGetsocketoption (
+     PRFileDesc *fd, PRSocketOptionData *data)
+ {
+     PR_ASSERT(fd != NULL);
+     PR_ASSERT(fd->lower != NULL);
+ 
+     return (fd->lower->methods->getsocketoption)(fd->lower, data);
+ }
+@@ -413,18 +441,23 @@ static PRIOMethods pl_methods = {
+     pl_DefSend,
+     pl_DefRecvfrom,
+     pl_DefSendto,
+     pl_DefPoll,
+     pl_DefAcceptread,
+     pl_DefTransmitfile,
+     pl_DefGetsockname,
+     pl_DefGetpeername,
++#if defined(ENABLE_SCTP)
++    pl_DefSctp_recvmsg,
++    pl_DefSctp_sendmsg,
++#else
+     (PRReservedFN)_PR_InvalidInt,
+     (PRReservedFN)_PR_InvalidInt,
++#endif
+     pl_DefGetsocketoption,
+     pl_DefSetsocketoption,
+     pl_DefSendfile,
+     pl_DefConnectcontinue,
+     (PRReservedFN)_PR_InvalidInt,
+     (PRReservedFN)_PR_InvalidInt,
+     (PRReservedFN)_PR_InvalidInt,
+     (PRReservedFN)_PR_InvalidInt
+diff --git a/nsprpub/pr/src/io/prmapopt.c b/nsprpub/pr/src/io/prmapopt.c
+--- a/nsprpub/pr/src/io/prmapopt.c
++++ b/nsprpub/pr/src/io/prmapopt.c
+@@ -417,32 +417,88 @@ PRStatus PR_CALLBACK _PR_SocketSetSocket
+ #ifndef SO_BROADCAST                    /* enable broadcast on UDP sockets  */
+ #define SO_BROADCAST        _PR_NO_SUCH_SOCKOPT
+ #endif
+ 
+ #ifndef SO_REUSEPORT                    /* allow local address & port reuse */
+ #define SO_REUSEPORT        _PR_NO_SUCH_SOCKOPT
+ #endif
+ 
++#if defined(ENABLE_SCTP)
++#ifndef SCTP_DEFAULT_SEND_PARAM         /* set default outgoing parameters and */
++#define SCTP_DEFAULT_SEND_PARAM  _PR_NO_SUCH_SOCKOPT  /* get incoming msg info */
++#endif
++
++#ifndef SCTP_USE_EXT_RCVINFO            /* enable/disable extrcvinfo messages */
++#define SCTP_USE_EXT_RCVINFO     _PR_NO_SUCH_SOCKOPT
++#endif
++
++#ifndef SCTP_EVENTS                     /* enable/disable sndrcvinfo messages */
++#define SCTP_EVENTS         _PR_NO_SUCH_SOCKOPT
++#endif
++
++#ifndef SCTP_INITMSG                    /* get/set INIT chunk parameters*/
++#define SCTP_INITMSG        _PR_NO_SUCH_SOCKOPT
++#endif
++
++#ifndef SCTP_ASSOCINFO                  /* get/set/change association info */
++#define SCTP_ASSOCINFO      _PR_NO_SUCH_SOCKOPT
++#endif
++
++#ifndef SCTP_NODELAY                    /* enable/disable Nagle algorithm */
++#define SCTP_NODELAY        _PR_NO_SUCH_SOCKOPT
++#endif
++
++#ifndef SCTP_MAXSEG                     /* set/get maximum fragment size */
++#define SCTP_MAXSEG         _PR_NO_SUCH_SOCKOPT
++#endif
++
++#ifndef SCTP_STATUS                     /* get current state of association */
++#define SCTP_STATUS         _PR_NO_SUCH_SOCKOPT
++#endif
++
++#ifndef SCTP_SET_PEER_PRIMARY_ADDR      /* set peer's primary address */
++#define SCTP_SET_PEER_PRIMARY_ADDR  _PR_NO_SUCH_SOCKOPT
++#endif
++
++#ifndef SCTP_SET_PRIMARY_ADDR           /* set primary address */
++#define SCTP_SET_PRIMARY_ADDR  _PR_NO_SUCH_SOCKOPT
++#endif
++#endif
++
+ PRStatus _PR_MapOptionName(
+     PRSockOption optname, PRInt32 *level, PRInt32 *name)
+ {
+     static PRInt32 socketOptions[PR_SockOpt_Last] =
+     {
+         0, SO_LINGER, SO_REUSEADDR, SO_KEEPALIVE, SO_RCVBUF, SO_SNDBUF,
+         IP_TTL, IP_TOS, IP_ADD_MEMBERSHIP, IP_DROP_MEMBERSHIP,
+         IP_MULTICAST_IF, IP_MULTICAST_TTL, IP_MULTICAST_LOOP,
++#if defined(ENABLE_SCTP)
++        TCP_NODELAY, TCP_MAXSEG, SO_BROADCAST, SO_REUSEPORT,
++        SCTP_DEFAULT_SEND_PARAM, SCTP_USE_EXT_RCVINFO, SCTP_EVENTS, 
++        SCTP_INITMSG, SCTP_ASSOCINFO, SCTP_NODELAY, SCTP_MAXSEG, 
++        SCTP_STATUS, SCTP_SET_PEER_PRIMARY_ADDR, SCTP_SET_PRIMARY_ADDR
++#else
+         TCP_NODELAY, TCP_MAXSEG, SO_BROADCAST, SO_REUSEPORT
++#endif
+     };
+     static PRInt32 socketLevels[PR_SockOpt_Last] =
+     {
+         0, SOL_SOCKET, SOL_SOCKET, SOL_SOCKET, SOL_SOCKET, SOL_SOCKET,
+         IPPROTO_IP, IPPROTO_IP, IPPROTO_IP, IPPROTO_IP,
+         IPPROTO_IP, IPPROTO_IP, IPPROTO_IP,
++#if defined(ENABLE_SCTP)
++        IPPROTO_TCP, IPPROTO_TCP, SOL_SOCKET, SOL_SOCKET, IPPROTO_SCTP,
++        IPPROTO_SCTP, IPPROTO_SCTP, IPPROTO_SCTP, IPPROTO_SCTP,	
++        IPPROTO_SCTP, IPPROTO_SCTP, IPPROTO_SCTP, IPPROTO_SCTP,
++        IPPROTO_SCTP
++#else
+         IPPROTO_TCP, IPPROTO_TCP, SOL_SOCKET, SOL_SOCKET
++#endif
+     };
+ 
+     if ((optname < PR_SockOpt_Linger)
+     || (optname >= PR_SockOpt_Last))
+     {
+         PR_SetError(PR_INVALID_ARGUMENT_ERROR, 0);
+         return PR_FAILURE;
+     }
+diff --git a/nsprpub/pr/src/io/prpolevt.c b/nsprpub/pr/src/io/prpolevt.c
+--- a/nsprpub/pr/src/io/prpolevt.c
++++ b/nsprpub/pr/src/io/prpolevt.c
+@@ -71,19 +71,24 @@ static PRIOMethods _pr_polevt_methods = 
+     (PRRecvFN)_PR_InvalidInt,        
+     (PRSendFN)_PR_InvalidInt,        
+     (PRRecvfromFN)_PR_InvalidInt,    
+     (PRSendtoFN)_PR_InvalidInt,        
+     _pr_PolEvtPoll,
+     (PRAcceptreadFN)_PR_InvalidInt,   
+     (PRTransmitfileFN)_PR_InvalidInt, 
+     (PRGetsocknameFN)_PR_InvalidStatus,    
+-    (PRGetpeernameFN)_PR_InvalidStatus,    
++    (PRGetpeernameFN)_PR_InvalidStatus,
++#if defined(ENABLE_SCTP)
++    (PRSctp_recvmsgFN)_PR_InvalidInt,
++    (PRSctp_sendmsgFN)_PR_InvalidInt,
++#else    
+     (PRReservedFN)_PR_InvalidInt,    
+-    (PRReservedFN)_PR_InvalidInt,    
++    (PRReservedFN)_PR_InvalidInt,
++#endif    
+     (PRGetsocketoptionFN)_PR_InvalidStatus,
+     (PRSetsocketoptionFN)_PR_InvalidStatus,
+     (PRSendfileFN)_PR_InvalidInt, 
+     (PRConnectcontinueFN)_PR_InvalidStatus, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt
+diff --git a/nsprpub/pr/src/md/unix/linux.c b/nsprpub/pr/src/md/unix/linux.c
+--- a/nsprpub/pr/src/md/unix/linux.c
++++ b/nsprpub/pr/src/md/unix/linux.c
+@@ -27,16 +27,353 @@ PRWord *_MD_HomeGCRegisters(PRThread *t,
+ 
+ extern void _MD_unix_terminate_waitpid_daemon(void);
+ 
+ void _MD_CleanupBeforeExit(void)
+ {
+     _MD_unix_terminate_waitpid_daemon();
+ }
+ 
++#if defined(ENABLE_SCTP)
++PRInt32 _MD_Sctp_Recvmsg(
++    int                  osfd,
++    void                *buf,
++    PRInt32              amount,
++    PRNetAddr           *from,
++    PRUint32            *fromlen,
++    PRSctp_SndRcvInfo   *sinfo,
++    PRInt32             *msg_flags)
++{
++    PRInt32 bytes;
++    struct sctp_sndrcvinfo md_sinfo;
++
++    memset(&md_sinfo, 0, sizeof(md_sinfo));
++    bytes = sctp_recvmsg(           osfd,
++                                    buf,
++                                    amount,
++                 (struct sockaddr*) from,
++                                    fromlen,
++                                   &md_sinfo,
++                                    msg_flags);
++
++    sinfo->sinfo_stream    = md_sinfo.sinfo_stream;
++    sinfo->sinfo_ssn       = md_sinfo.sinfo_ssn;
++    sinfo->sinfo_flags     = md_sinfo.sinfo_flags;
++    sinfo->sinfo_ppid      = md_sinfo.sinfo_ppid;
++    sinfo->sinfo_context   = md_sinfo.sinfo_context;
++    sinfo->sinfo_pr_value  = md_sinfo.sinfo_timetolive;
++    sinfo->sinfo_tsn       = md_sinfo.sinfo_tsn;
++    sinfo->sinfo_cumtsn    = md_sinfo.sinfo_cumtsn;
++    sinfo->sinfo_assoc_id  = md_sinfo.sinfo_assoc_id;
++
++    return bytes;
++}
++
++PRInt32 _MD_SCTPGetSocketOption(PRFileDesc *fd, PRSocketOptionData *data)
++{
++    PRStatus result;
++    PRIntn rv;
++    PRInt32 level, name;
++    PRUint32 length;
++
++    result = _PR_MapOptionName(data->option, &level, &name);
++    if (PR_SUCCESS == result)
++    {
++        switch (data->option)
++        {
++            case PR_SockOpt_DefaultSendParam:
++            {
++                struct sctp_sndrcvinfo md_sndrcvinfo;
++                length = sizeof(md_sndrcvinfo);
++                memset(&md_sndrcvinfo, 0, length);
++                rv = getsockopt(fd->secret->md.osfd, level, name, (void *)&md_sndrcvinfo,
++                                &length);
++                PR_ASSERT((-1 == rv) || (sizeof(md_sndrcvinfo) == length));
++                data->value.sndrcvinfo.sinfo_stream    = md_sndrcvinfo.sinfo_stream;
++                data->value.sndrcvinfo.sinfo_ssn       = md_sndrcvinfo.sinfo_ssn;
++                data->value.sndrcvinfo.sinfo_flags     = md_sndrcvinfo.sinfo_flags;
++                data->value.sndrcvinfo.sinfo_ppid      = md_sndrcvinfo.sinfo_ppid;
++                data->value.sndrcvinfo.sinfo_context   = md_sndrcvinfo.sinfo_context;
++                data->value.sndrcvinfo.sinfo_pr_value  = md_sndrcvinfo.sinfo_timetolive;
++                data->value.sndrcvinfo.sinfo_tsn       = md_sndrcvinfo.sinfo_tsn;
++                data->value.sndrcvinfo.sinfo_cumtsn    = md_sndrcvinfo.sinfo_cumtsn;
++                data->value.sndrcvinfo.sinfo_assoc_id  = md_sndrcvinfo.sinfo_assoc_id;
++                break;
++            }
++            case PR_SockOpt_Events:
++            {
++                struct sctp_event_subscribe md_events;
++                length = sizeof(md_events);
++                memset(&md_events, 0, length);
++                rv = getsockopt(fd->secret->md.osfd, level, name, (void *)&md_events, &length);
++                PR_ASSERT((-1 == rv) || (sizeof(md_events) == length));
++                data->value.events.sctp_data_io_event =
++                    md_events.sctp_data_io_event;
++                data->value.events.sctp_association_event =
++                    md_events.sctp_association_event;
++                data->value.events.sctp_address_event =
++                    md_events.sctp_address_event;
++                data->value.events.sctp_send_failure_event =
++                    md_events.sctp_send_failure_event;
++                data->value.events.sctp_peer_error_event =
++                    md_events.sctp_peer_error_event;
++                data->value.events.sctp_shutdown_event =
++                    md_events.sctp_shutdown_event;
++                data->value.events.sctp_partial_delivery_event =
++                    md_events.sctp_partial_delivery_event;
++                data->value.events.sctp_adaptation_layer_event =
++                    md_events.sctp_adaptation_layer_event;
++                data->value.events.sctp_authentication_event =
++                    md_events.sctp_authentication_event;
++                data->value.events.sctp_sender_dry_event = 0;
++                break;
++            }
++            case PR_SockOpt_InitMsg:
++            {
++                PRSctp_InitMsg initmsg;
++                length = sizeof(initmsg);
++                memset(&initmsg, 0, length);
++                rv = getsockopt(fd->secret->md.osfd, level, name, (void *)&initmsg,
++                                &length);
++                PR_ASSERT((-1 == rv) || (sizeof(initmsg) == length));
++                data->value.initmsg.sinit_num_ostreams   =
++                    initmsg.sinit_num_ostreams;
++                data->value.initmsg.sinit_max_instreams  =
++                    initmsg.sinit_max_instreams;
++                data->value.initmsg.sinit_max_attempts   =
++                    initmsg.sinit_max_attempts;
++                data->value.initmsg.sinit_max_init_timeo =
++                    initmsg.sinit_max_init_timeo;
++                break;
++            }
++            case PR_SockOpt_AssocInfo:
++            {
++                PRSctp_AssocParams assocparams;
++                length = sizeof(assocparams);
++                memset(&assocparams, 0, length);
++                rv = getsockopt(fd->secret->md.osfd, level, name, (void *)&assocparams,
++                                &length);
++                PR_ASSERT((-1 == rv) || (sizeof(assocparams) == length));
++                data->value.assocparams.sasoc_assoc_id =
++                    assocparams.sasoc_assoc_id;
++                data->value.assocparams.sasoc_asocmaxrxt =
++                    assocparams.sasoc_asocmaxrxt;
++                data->value.assocparams.sasoc_number_peer_destinations =
++                    assocparams.sasoc_number_peer_destinations;
++                data->value.assocparams.sasoc_peer_rwnd =
++                    assocparams.sasoc_peer_rwnd;
++                data->value.assocparams.sasoc_local_rwnd =
++                    assocparams.sasoc_local_rwnd;
++                data->value.assocparams.sasoc_cookie_life =
++                    assocparams.sasoc_cookie_life;
++                break;
++            }
++            case PR_SockOpt_SctpMaxSegment:
++            {
++                PRSctp_Assoc_Value sctp_maxseg;
++                length = sizeof(sctp_maxseg);
++                memset(&sctp_maxseg, 0, length);
++                rv = getsockopt(
++                    fd->secret->md.osfd, level, name, (void *)&sctp_maxseg, &length);
++                PR_ASSERT((-1 == rv) || (sizeof(sctp_maxseg) == length));
++                data->value.sctp_maxseg.assoc_id = sctp_maxseg.assoc_id;
++                data->value.sctp_maxseg.assoc_value = sctp_maxseg.assoc_value;
++                break;
++            }
++            case PR_SockOpt_Status:
++            {
++                struct sctp_status md_status;
++                length = sizeof(md_status);
++                memset(&md_status, 0, length);
++                rv = getsockopt(
++                    fd->secret->md.osfd, level, name, (void *)&md_status, &length);
++                PR_ASSERT((-1 == rv) || (sizeof(md_status) == length));
++                data->value.status.sstat_assoc_id  = md_status.sstat_assoc_id;
++                data->value.status.sstat_state     = md_status.sstat_state;
++                data->value.status.sstat_rwnd      = md_status.sstat_rwnd;
++                data->value.status.sstat_unackdata = md_status.sstat_unackdata;
++                data->value.status.sstat_penddata  = md_status.sstat_penddata;
++                data->value.status.sstat_instrms   = md_status.sstat_instrms;
++                data->value.status.sstat_outstrms  = md_status.sstat_outstrms;
++                data->value.status.sstat_fragmentation_point =
++                         md_status.sstat_fragmentation_point;
++                /* Can't memcpy data->value.status.sstat_primary because    */
++                /* data->value.status.sstat_primary.spinfo_address is type  */
++                /* PRNetAddr, while md_status.sstat_primary.spinfo_address  */
++                /* is the much larger sockaddr_storage.                     */
++                data->value.status.sstat_primary.spinfo_assoc_id =
++                         md_status.sstat_primary.spinfo_assoc_id;
++                memcpy(&(data->value.status.sstat_primary.spinfo_address),
++                    &(md_status.sstat_primary.spinfo_address), sizeof(PRNetAddr));
++                /* PRNetAddr is based on the 4.3BSD compatible sockaddr_in6 */
++                /* structure, which is also used by Linux, so there is no   */
++                /* need to correct PRNetAddr.family after copying the       */
++                /* sockaddr_storage structure.                              */
++                data->value.status.sstat_primary.spinfo_state =
++                         md_status.sstat_primary.spinfo_state;
++                data->value.status.sstat_primary.spinfo_cwnd =
++                         md_status.sstat_primary.spinfo_cwnd;
++                data->value.status.sstat_primary.spinfo_srtt =
++                         md_status.sstat_primary.spinfo_srtt;
++                data->value.status.sstat_primary.spinfo_rto =
++                         md_status.sstat_primary.spinfo_rto;
++                data->value.status.sstat_primary.spinfo_mtu =
++                         md_status.sstat_primary.spinfo_mtu;
++                break;
++            }
++            default:
++                PR_NOT_REACHED("Unknown socket option");
++                break;
++        }
++        return rv;
++    }
++    return -1;    /* PR_MapOptionName returned PR_FAILURE */
++}
++
++PRInt32 _MD_SCTPSetSocketOption(PRFileDesc *fd, const PRSocketOptionData *data)
++{
++    PRStatus result;
++    PRIntn rv;
++    PRInt32 level, name;
++    PRUint32 length;
++
++    result = _PR_MapOptionName(data->option, &level, &name);
++    if (PR_SUCCESS == result)
++    {
++        switch (data->option)
++        {
++            case PR_SockOpt_DefaultSendParam:
++            {
++                struct sctp_sndrcvinfo md_sndrcvinfo;
++                length = sizeof(md_sndrcvinfo);
++                memset(&md_sndrcvinfo, 0, length);
++                md_sndrcvinfo.sinfo_stream     = data->value.sndrcvinfo.sinfo_stream;
++                md_sndrcvinfo.sinfo_ssn        = data->value.sndrcvinfo.sinfo_ssn;
++                md_sndrcvinfo.sinfo_flags      = data->value.sndrcvinfo.sinfo_flags;
++                md_sndrcvinfo.sinfo_ppid       = data->value.sndrcvinfo.sinfo_ppid;
++                md_sndrcvinfo.sinfo_context    = data->value.sndrcvinfo.sinfo_context;
++                md_sndrcvinfo.sinfo_timetolive = data->value.sndrcvinfo.sinfo_pr_value;
++                md_sndrcvinfo.sinfo_tsn        = data->value.sndrcvinfo.sinfo_tsn;
++                md_sndrcvinfo.sinfo_cumtsn     = data->value.sndrcvinfo.sinfo_cumtsn;
++                md_sndrcvinfo.sinfo_assoc_id   = data->value.sndrcvinfo.sinfo_assoc_id;
++                rv = setsockopt(fd->secret->md.osfd, level, name, (void *)&md_sndrcvinfo,
++                                length);
++                break;
++            }
++            case PR_SockOpt_Events:
++            {
++                struct sctp_event_subscribe md_events;
++                length = sizeof(md_events);
++                memset(&md_events, 0, length);
++                md_events.sctp_data_io_event =
++                    data->value.events.sctp_data_io_event;
++                md_events.sctp_association_event =
++                    data->value.events.sctp_association_event;
++                md_events.sctp_address_event =
++                    data->value.events.sctp_address_event;
++                md_events.sctp_send_failure_event =
++                    data->value.events.sctp_send_failure_event;
++                md_events.sctp_peer_error_event =
++                    data->value.events.sctp_peer_error_event;
++                md_events.sctp_shutdown_event =
++                    data->value.events.sctp_shutdown_event;
++                md_events.sctp_partial_delivery_event =
++                    data->value.events.sctp_partial_delivery_event;
++                md_events.sctp_adaptation_layer_event =
++                    data->value.events.sctp_adaptation_layer_event;
++                md_events.sctp_authentication_event =
++                    data->value.events.sctp_authentication_event;
++                /* sender_dry_event not support on Linux */
++                rv = setsockopt(fd->secret->md.osfd, level, name, (void *)&md_events,
++                                length);
++                break;
++            }
++            case PR_SockOpt_InitMsg:
++            {
++                PRSctp_InitMsg initmsg;
++                length = sizeof(initmsg);
++                memset(&initmsg, 0, length);
++                initmsg.sinit_num_ostreams   =
++                    data->value.initmsg.sinit_num_ostreams;
++                initmsg.sinit_max_instreams  =
++                    data->value.initmsg.sinit_max_instreams;
++                initmsg.sinit_max_attempts   =
++                    data->value.initmsg.sinit_max_attempts;
++                initmsg.sinit_max_init_timeo =
++                    data->value.initmsg.sinit_max_init_timeo;
++                rv = setsockopt(fd->secret->md.osfd, level, name, (void *)&initmsg,
++                                length);
++                break;
++            }
++            case PR_SockOpt_AssocInfo:
++            {
++                PRSctp_AssocParams assocparams;
++                length = sizeof(assocparams);
++                memset(&assocparams, 0, length);
++                assocparams.sasoc_assoc_id =
++                    data->value.assocparams.sasoc_assoc_id;
++                assocparams.sasoc_asocmaxrxt =
++                    data->value.assocparams.sasoc_asocmaxrxt;
++                assocparams.sasoc_number_peer_destinations =
++                    data->value.assocparams.sasoc_number_peer_destinations;
++                assocparams.sasoc_peer_rwnd =
++                    data->value.assocparams.sasoc_peer_rwnd;
++                assocparams.sasoc_local_rwnd =
++                    data->value.assocparams.sasoc_local_rwnd;
++                assocparams.sasoc_cookie_life =
++                    data->value.assocparams.sasoc_cookie_life;
++                rv = setsockopt(fd->secret->md.osfd, level, name, (void *)&assocparams,
++                                length);
++                break;
++            }
++            case PR_SockOpt_SctpMaxSegment:
++            {
++                PRSctp_Assoc_Value sctp_maxseg;
++                length = sizeof(sctp_maxseg);
++                memset(&sctp_maxseg, 0, length);
++                sctp_maxseg.assoc_id = data->value.sctp_maxseg.assoc_id;
++                sctp_maxseg.assoc_value = data->value.sctp_maxseg.assoc_value;
++                rv = setsockopt(fd->secret->md.osfd, level, name, (void *)&sctp_maxseg,
++                                length);
++                break;
++            }
++            case PR_SockOpt_SetPeerPrimaryAddr:
++            {
++                struct sctp_setpeerprim md_setpeerprim;
++                length = sizeof(md_setpeerprim);
++                memset(&md_setpeerprim, 0, length);
++                md_setpeerprim.sspp_assoc_id = data->value.setpeerprim.sspp_assoc_id;
++                memcpy(&(md_setpeerprim.sspp_addr),
++                       &(data->value.setpeerprim.sspp_addr), sizeof(PRNetAddr));
++                rv = setsockopt(fd->secret->md.osfd, level, name, (void *)&md_setpeerprim,
++                                length);
++                break;
++            }
++            case PR_SockOpt_SetPrimaryAddr:
++            {
++                struct sctp_setprim md_setprim;
++                length = sizeof(md_setprim);
++                memset(&md_setprim, 0, length);
++                md_setprim.ssp_assoc_id = data->value.setprim.ssp_assoc_id;
++                memcpy(&(md_setprim.ssp_addr),
++                       &(data->value.setprim.ssp_addr), sizeof(PRNetAddr));
++                rv = setsockopt(fd->secret->md.osfd, level, name, (void *)&md_setprim,
++                                length);
++                break;
++            }
++            default:
++                PR_NOT_REACHED("Unknown socket option");
++                break;
++        }
++        return rv;
++    }
++    return -1;    /* PR_MapOptionName returned PR_FAILURE - should never happen here. */
++}
++#endif /* ENABLE_SCTP */
++
+ #else /* ! _PR_PTHREADS */
+ 
+ void
+ _MD_SET_PRIORITY(_MDThread *thread, PRUintn newPri)
+ {
+     return;
+ }
+ 
+diff --git a/nsprpub/pr/tests/Makefile.in b/nsprpub/pr/tests/Makefile.in
+--- a/nsprpub/pr/tests/Makefile.in
++++ b/nsprpub/pr/tests/Makefile.in
+@@ -187,16 +187,22 @@ endif
+ ifeq ($(OS_TARGET),OS2)
+ CSRCS +=            \
+ 	sleep.c			\
+ 	stat.c		    \
+ 	yield.c         \
+ 	$(NULL)
+ endif
+ 
++ifeq ($(ENABLE_SCTP), 1)
++CSRCS +=            \
++         sctp.c     \
++         $(NULL)
++endif
++
+ ifeq (,$(filter-out WINCE WINNT OS2,$(OS_ARCH)))
+ PROG_SUFFIX = .exe
+ DLL_SUFFIX = .dll
+ else
+ PROG_SUFFIX =
+ DLL_SUFFIX = 
+ endif
+ 
+@@ -378,16 +384,20 @@ LIBPTHREAD = -ldce
+ endif
+ endif
+ 
+ ifeq ($(OS_TARGET),Android)
+ LIBPTHREAD =
+ XCFLAGS = $(OS_CFLAGS)
+ endif
+ 
++ifeq ($(USE_LIBSCTP),1)
++LDOPTS += -lsctp
++endif
++
+ #####################################################
+ #
+ # The rules
+ #
+ #####################################################
+ 
+ include $(topsrcdir)/config/rules.mk
+ 

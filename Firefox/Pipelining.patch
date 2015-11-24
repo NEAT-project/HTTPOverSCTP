@@ -1,0 +1,2639 @@
+changeset:   269913:c94f83ccbe84
+tag:         tip
+user:        ruengeler <i.ruengeler@fh-muenster.de>
+date:        Thu Nov 12 06:20:37 2015 -0800
+summary:     Add pipelining with a lot of debug output.
+
+diff --git a/netwerk/base/nsSocketTransport2.cpp b/netwerk/base/nsSocketTransport2.cpp
+--- a/netwerk/base/nsSocketTransport2.cpp
++++ b/netwerk/base/nsSocketTransport2.cpp
+@@ -810,19 +810,21 @@ nsSocketTransport::nsSocketTransport()
+     , mSocketTransportService(gSocketTransportService)
+     , mInput(this)
+     , mOutput(this)
+     , mQoSBits(0x00)
+     , mKeepaliveEnabled(false)
+     , mKeepaliveIdleTimeS(-1)
+     , mKeepaliveRetryIntervalS(-1)
+     , mKeepaliveProbeCount(-1)
++#ifdef ENABLE_SCTP
+     , mNextSctpInputStreamId (-1)
+     , mNextSctpOutputStreamId (-1)
+-    , mNumberOfSctpStreams (0)
++    , mNumberOfSctpStreams (-1)
++#endif
+ {
+     SOCKET_LOG(("creating nsSocketTransport @%p\n", this));
+ 
+     mTimeouts[TIMEOUT_CONNECT]    = UINT16_MAX; // no timeout
+     mTimeouts[TIMEOUT_READ_WRITE] = UINT16_MAX; // no timeout
+ }
+ 
+ nsSocketTransport::~nsSocketTransport()
+@@ -1134,17 +1136,17 @@ nsSocketTransport::ResolveHost()
+         mState = STATE_RESOLVING;
+     }
+     return rv;
+ }
+ 
+ nsresult
+ nsSocketTransport::BuildSocket(PRFileDesc *&fd, bool &proxyTransparent, bool &usingSSL)
+ {
+-    SOCKET_LOG(("nsSocketTransport::BuildSocket [this=%p]\n", this));
++    SOCKET_LOG(("!!!!!!!!nsSocketTransport::BuildSocket [this=%p]\n", this));
+ 
+     nsresult rv;
+ 
+     proxyTransparent = false;
+     usingSSL = false;
+ 
+     if (mTypeCount == 0) {
+ #if defined(ENABLE_SCTP)
+@@ -1320,17 +1322,17 @@ nsSocketTransport::BuildSocket(PRFileDes
+     }
+ 
+     return rv;
+ }
+ 
+ nsresult
+ nsSocketTransport::InitiateSocket()
+ {
+-    SOCKET_LOG(("nsSocketTransport::InitiateSocket [this=%p]\n", this));
++    SOCKET_LOG(("!!!!!!!!!!!!nsSocketTransport::InitiateSocket [this=%p]\n", this));
+ 
+     static int crashOnNonLocalConnections = -1;
+     if (crashOnNonLocalConnections == -1) {
+         const char *s = getenv("MOZ_DISABLE_NONLOCAL_CONNECTIONS");
+         if (s) {
+             crashOnNonLocalConnections = !!strncmp(s, "0", 1);
+         } else {
+             crashOnNonLocalConnections = 0;
+@@ -1539,16 +1541,17 @@ nsSocketTransport::InitiateSocket()
+             Telemetry::PRCONNECT_BLOCKING_TIME_NORMAL,
+             Telemetry::PRCONNECT_BLOCKING_TIME_SHUTDOWN,
+             Telemetry::PRCONNECT_BLOCKING_TIME_CONNECTIVITY_CHANGE,
+             Telemetry::PRCONNECT_BLOCKING_TIME_LINK_CHANGE,
+             Telemetry::PRCONNECT_BLOCKING_TIME_OFFLINE);
+     }
+ 
+     if (status == PR_SUCCESS) {
++        SOCKET_LOG(("We are connected\n"));
+         // 
+         // we are connected!
+         //
+ #if defined(ENABLE_SCTP)
+         rv = SetNumberOfOutgoingSctpStreams(fd);
+         if(NS_FAILED(rv))
+             return rv;
+ #endif
+@@ -1557,21 +1560,23 @@ nsSocketTransport::InitiateSocket()
+         PRErrorCode code = PR_GetError();
+ #if defined(TEST_CONNECT_ERRORS)
+         code = RandomizeConnectError(code);
+ #endif
+         //
+         // If the PR_Connect(...) would block, then poll for a connection.
+         //
+         if ((PR_WOULD_BLOCK_ERROR == code) || (PR_IN_PROGRESS_ERROR == code)) {
++        printf("PR_WOULD_BLOCK_ERROR || PR_IN_PROGRESS_ERROR\n");
+             mPollFlags = (PR_POLL_EXCEPT | PR_POLL_WRITE);
+         //
+         // If the socket is already connected, then return success...
+         //
+         } else if (PR_IS_CONNECTED_ERROR == code) {
++            printf("PR_IS_CONNECTED_ERROR, but we are connected\n");
+             //
+             // we are connected!
+             //
+ #if defined(ENABLE_SCTP)
+             rv = SetNumberOfOutgoingSctpStreams(fd);
+             if(NS_FAILED(rv))
+                return rv;
+ #endif
+@@ -1598,23 +1603,25 @@ nsSocketTransport::InitiateSocket()
+         }
+         //
+         // A SOCKS request was rejected; get the actual error code from
+         // the OS error
+         //
+         else if (PR_UNKNOWN_ERROR == code &&
+                  mProxyTransparent &&
+                  !mProxyHost.IsEmpty()) {
++                 printf("PR_UNKNOWN_ERROR\n");
+             code = PR_GetOSError();
+             rv = ErrorAccordingToNSPR(code);
+         }
+         //
+         // The connection was refused...
+         //
+         else {
++        printf("connection refused\n");
+             rv = ErrorAccordingToNSPR(code);
+             if ((rv == NS_ERROR_CONNECTION_REFUSED) && !mProxyHost.IsEmpty())
+                 rv = NS_ERROR_PROXY_CONNECTION_REFUSED;
+         }
+     }
+     return rv;
+ }
+ 
+@@ -1900,17 +1907,17 @@ nsSocketTransport::ReleaseFD_Locked(PRFi
+ }
+ 
+ #if defined(ENABLE_SCTP)
+ // Update mNextSctpInputStreamId by doing a peek
+ NS_IMETHODIMP
+ nsSocketTransport::UpdateNextSctpInputStreamId()
+ {
+     nsresult rv = NS_OK;
+-
++printf("nsSocketTransport::UpdateNextSctpInputStreamId()\n");
+     char c;
+     int32_t n;
+     PRNetAddr from;
+     uint32_t fromlen;
+     int msg_flags = PR_MSG_PEEK;
+ #if defined(SCTP_HAVE_EXTRCVINFO)
+     PRSctp_ExtRcvInfo eri;            // Darwin & FreeBSD only
+ #else
+@@ -1919,82 +1926,92 @@ nsSocketTransport::UpdateNextSctpInputSt
+     PRSctp_SndRcvInfo *sri = (PRSctp_SndRcvInfo*)&eri;
+     fromlen = sizeof(from);
+     memset(sri, 0, sizeof(eri));
+     {
+     MutexAutoLock lock(mLock);
+ #if defined(SCTP_1_BYTE_PEEK)  // Some implementations must read a byte to peek
+     n = PR_SctpRecvmsg(mFD, &c, 1, &from, &fromlen, sri, &msg_flags, 0);
+ #else                          // Some linux implementations consume bytes when peeking
+-    n = PR_SctpRecvmsg(mFD, &c, 0, &from, &fromlen, sri, &msg_flags, 0);
++    n = PR_SctpRecvmsg(mFD, &c, 1, &from, &fromlen, sri, &msg_flags, 0);
+ #endif
+     }
++    printf("returned from PR_SctpRecvmsg with n=%d\n", n);
+     mNextSctpInputStreamId = -1;
+ 
+     if (n >= 0) {
+         if (n == 0 && PR_GetError() == PR_NOT_CONNECTED_ERROR) {
++        printf("set rv=NS_BASE_STREAM_CLOSED\n");
+             rv = NS_BASE_STREAM_CLOSED;
+         } else {
+             mNextSctpInputStreamId = sri->sinfo_stream;
++            printf("mNextSctpInputStreamId is set to %d\n", mNextSctpInputStreamId);
+             NS_ASSERTION(mNextSctpInputStreamId >= 0 &&
+                          mNextSctpInputStreamId < mNumberOfSctpStreams,
+                          "Invalid SCTP stream ID");
+         }
+     } else if (PR_GetError() == PR_WOULD_BLOCK_ERROR) {
++    printf("set rv=NS_BASE_STREAM_WOULD_BLOCK\n");
+         rv = NS_BASE_STREAM_WOULD_BLOCK;
+     } else {
++    printf("set rv=NS_BASE_STREAM_CLOSED\n");
+         rv = NS_BASE_STREAM_CLOSED;
+     }
+     return rv;
+ }
+ #endif
+ 
+ 
+ NS_IMETHODIMP
+ nsSocketTransport::GetNextSctpInputStreamId(int32_t* aSctpStreamID)
+ {
+ #if !defined(ENABLE_SCTP)
+     return NS_ERROR_NOT_IMPLEMENTED;
+ #else
+     nsresult rv;
+     bool socketIsSctp;
+-
++printf("nsSocketTransport::GetNextSctpInputStreamId\n");
+     rv = IsSctpSocket(&socketIsSctp);
+-    if (NS_FAILED(rv))
++    if (NS_FAILED(rv)) {
++    printf("IsSctpSocket failed\n");
+         return rv;
+-
++    }
+     if (!socketIsSctp)
+         return NS_ERROR_INVALID_SOCKET_TYPE;
+     else
+         rv = NS_OK;
+ 
+     // If mNextSctpInputStreamId is invalid, update it.
+-    if (mNextSctpInputStreamId == -1)
++    if (mNextSctpInputStreamId == -1) {
+         rv = UpdateNextSctpInputStreamId();
+-
++    }
+     *aSctpStreamID = mNextSctpInputStreamId;
+-
++printf("nextInputStreamId=%d\n", mNextSctpInputStreamId);
+     return rv;
+ #endif
+ }
+ 
+ NS_IMETHODIMP
+ nsSocketTransport::GetNextSctpOutputStreamId(int32_t* aSctpStreamID)
+ {
+ #if !defined(ENABLE_SCTP)
+     return NS_ERROR_NOT_IMPLEMENTED;
+ #else
+     nsresult rv = NS_ERROR_FAILURE;
+     bool socketIsSctp;
+ 
+     rv = IsSctpSocket(&socketIsSctp);
+-    if (NS_FAILED(rv))
++    if (NS_FAILED(rv)) {
++    printf("IsSctpSocket failed\n");
+         return rv;
+-    if (!socketIsSctp)
++    }
++    if (!socketIsSctp) {
++    printf("SCTP: NS_ERROR_INVALID_SOCKET_TYPE\n");
+         return NS_ERROR_INVALID_SOCKET_TYPE;
++    }
+ 
+     *aSctpStreamID = mNextSctpOutputStreamId;
+     return NS_OK;
+ #endif
+ }
+ 
+ NS_IMETHODIMP
+ nsSocketTransport::GetNumberOfSctpStreams(int32_t* aNumberOfStreams)
+@@ -2066,19 +2083,20 @@ nsSocketTransport::OnSocketEvent(uint32_
+         // ensure that we have created a socket, attached it, and have a
+         // connection.
+         //
+         if (mState == STATE_CLOSED) {
+             // Unix domain sockets are ready to connect; mNetAddr is all we
+             // need. Internet address families require a DNS lookup (or possibly
+             // several) before we can connect.
+ #if defined(XP_UNIX)
+-            if (mNetAddrIsSet && mNetAddr.raw.family == AF_LOCAL)
++            if (mNetAddrIsSet && mNetAddr.raw.family == AF_LOCAL) {
++            printf("call InitiateSocket\n");
+                 mCondition = InitiateSocket();
+-            else
++            } else
+ #endif
+                 mCondition = ResolveHost();
+ 
+         } else {
+             SOCKET_LOG(("  ignoring redundant event\n"));
+         }
+         break;
+ 
+@@ -2100,21 +2118,25 @@ nsSocketTransport::OnSocketEvent(uint32_
+             // transport resolves the real host here, so there's no fixup 
+             // (see bug 226943).
+             if ((status == NS_ERROR_UNKNOWN_HOST) && !mProxyTransparent &&
+                 !mProxyHost.IsEmpty())
+                 mCondition = NS_ERROR_UNKNOWN_PROXY_HOST;
+             else
+                 mCondition = status;
+         }
+-        else if (mState == STATE_RESOLVING)
++        else if (mState == STATE_RESOLVING) {
++        printf("DNS is resolved: now initiate Socket\n");
+             mCondition = InitiateSocket();
++        printf("InitiateSocket returned\n");
++        }
+         break;
+ 
+     case MSG_RETRY_INIT_SOCKET:
++    printf("MSG_RETRY_INIT_SOCKET\n");
+         mCondition = InitiateSocket();
+         break;
+ 
+     case MSG_INPUT_CLOSED:
+         SOCKET_LOG(("  MSG_INPUT_CLOSED\n"));
+         OnMsgInputClosed(status);
+         break;
+ 
+@@ -2141,18 +2163,20 @@ nsSocketTransport::OnSocketEvent(uint32_
+         SOCKET_LOG(("  unhandled event!\n"));
+     }
+     
+     if (NS_FAILED(mCondition)) {
+         SOCKET_LOG(("  after event [this=%p cond=%x]\n", this, mCondition));
+         if (!mAttached) // need to process this error ourselves...
+             OnSocketDetached(nullptr);
+     }
+-    else if (mPollFlags == PR_POLL_EXCEPT)
++    else if (mPollFlags == PR_POLL_EXCEPT) {
++        printf("mPollFlags are set to 0 (idle)\n");
+         mPollFlags = 0; // make idle
++    }
+ }
+ 
+ //-----------------------------------------------------------------------------
+ // socket handler impl
+ 
+ void
+ nsSocketTransport::OnSocketReady(PRFileDesc *fd, int16_t outFlags)
+ {
+@@ -2178,16 +2202,17 @@ nsSocketTransport::OnSocketReady(PRFileD
+             // assume that we won't need to poll any longer (the stream will
+             // request that we poll again if it is still pending).
+             mPollFlags &= ~PR_POLL_READ;
+ 
+ #if defined(ENABLE_SCTP)
+             // if SCTP socket, get stream on which data arrived
+             if (PR_GetDescType(PR_GetIdentitiesLayer(fd, PR_NSPR_IO_LAYER)) ==
+                 PR_DESC_SOCKET_SCTP_ONE_TO_ONE) {
++                printf("SCTP Socket\n");
+                 if (NS_FAILED(UpdateNextSctpInputStreamId()))
+                     mInput.OnSocketReady(NS_ERROR_FAILURE);
+                 else
+                     mInput.OnSocketReady(NS_OK);
+             }
+             else  // not SCTP
+ #endif
+             mInput.OnSocketReady(NS_OK);
+diff --git a/netwerk/protocol/http/nsAHttpTransaction.h b/netwerk/protocol/http/nsAHttpTransaction.h
+--- a/netwerk/protocol/http/nsAHttpTransaction.h
++++ b/netwerk/protocol/http/nsAHttpTransaction.h
+@@ -71,16 +71,23 @@ public:
+     // called to read request data from the transaction.
+     virtual nsresult ReadSegments(nsAHttpSegmentReader *reader,
+                                   uint32_t count, uint32_t *countRead) = 0;
+ 
+     // called to write response data to the transaction.
+     virtual nsresult WriteSegments(nsAHttpSegmentWriter *writer,
+                                    uint32_t count, uint32_t *countWritten) = 0;
+ 
++#if defined(ENABLE_SCTP)
++    // Called to write response data to the transaction, and pass transaction.
++    virtual nsresult WriteSegments(nsAHttpSegmentWriter *writer,
++                                   uint32_t count, uint32_t *countWritten,
++                                   nsAHttpTransaction *trans) { return NS_ERROR_FAILURE; };
++#endif
++
+     // called to close the transaction
+     virtual void Close(nsresult reason) = 0;
+ 
+     // called to indicate a failure with proxy CONNECT
+     virtual void SetProxyConnectFailed() = 0;
+ 
+     // called to retrieve the request headers of the transaction
+     virtual nsHttpRequestHead *RequestHead() = 0;
+@@ -189,16 +196,17 @@ public:
+     }
+ 
+     virtual void DisableSpdy() { }
+     virtual void ReuseConnectionOnRestartOK(bool) { }
+ };
+ 
+ NS_DEFINE_STATIC_IID_ACCESSOR(nsAHttpTransaction, NS_AHTTPTRANSACTION_IID)
+ 
++#ifdef ENABLE_SCTP
+ #define NS_DECL_NSAHTTPTRANSACTION \
+     void SetConnection(nsAHttpConnection *) override; \
+     nsAHttpConnection *Connection() override; \
+     void GetSecurityCallbacks(nsIInterfaceRequestor **) override;       \
+     void OnTransportStatus(nsITransport* transport, \
+                            nsresult status, int64_t progress) override; \
+     bool     IsDone() override; \
+     nsresult Status() override; \
+@@ -212,16 +220,41 @@ NS_DEFINE_STATIC_IID_ACCESSOR(nsAHttpTra
+     void     SetProxyConnectFailed() override;                                   \
+     virtual nsHttpRequestHead *RequestHead() override;                                   \
+     uint32_t Http1xTransactionCount() override;                                  \
+     nsresult TakeSubTransactions(nsTArray<RefPtr<nsAHttpTransaction> > &outTransactions) override; \
+     nsresult AddTransaction(nsAHttpTransaction *) override;                      \
+     uint32_t PipelineDepth() override;                                           \
+     nsresult SetPipelinePosition(int32_t) override;                              \
+     int32_t  PipelinePosition() override;
++#else
++#define NS_DECL_NSAHTTPTRANSACTION \
++    void SetConnection(nsAHttpConnection *) override; \
++    nsAHttpConnection *Connection() override; \
++    void GetSecurityCallbacks(nsIInterfaceRequestor **) override;       \
++    void OnTransportStatus(nsITransport* transport, \
++                           nsresult status, int64_t progress) override; \
++    bool     IsDone() override; \
++    nsresult Status() override; \
++    uint32_t Caps() override;   \
++    void     SetDNSWasRefreshed() override; \
++    uint64_t Available() override; \
++    virtual nsresult ReadSegments(nsAHttpSegmentReader *, uint32_t, uint32_t *) override; \
++    virtual nsresult WriteSegments(nsAHttpSegmentWriter *, uint32_t, uint32_t *) override; \
++    virtual void Close(nsresult reason) override;                                \
++    nsHttpConnectionInfo *ConnectionInfo() override;                             \
++    void     SetProxyConnectFailed() override;                                   \
++    virtual nsHttpRequestHead *RequestHead() override;                                   \
++    uint32_t Http1xTransactionCount() override;                                  \
++    nsresult TakeSubTransactions(nsTArray<RefPtr<nsAHttpTransaction> > &outTransactions) override; \
++    nsresult AddTransaction(nsAHttpTransaction *) override;                      \
++    uint32_t PipelineDepth() override;                                           \
++    nsresult SetPipelinePosition(int32_t) override;                              \
++    int32_t  PipelinePosition() override;
++#endif
+ 
+ //-----------------------------------------------------------------------------
+ // nsAHttpSegmentReader
+ //-----------------------------------------------------------------------------
+ 
+ class nsAHttpSegmentReader
+ {
+ public:
+@@ -239,18 +272,32 @@ public:
+     // commitment now but might in the future and forceCommitment is not true .
+     // (forceCommitment requires a hard failure or OK at this moment.)
+     //
+     // SpdySession uses this to make sure frames are atomic.
+     virtual nsresult CommitToSegmentSize(uint32_t size, bool forceCommitment)
+     {
+         return NS_ERROR_FAILURE;
+     }
++
++#if defined(ENABLE_SCTP)
++    // Pass transaction via OnReadSegment
++    virtual nsresult OnReadSegment(const char *segment,
++                                   uint32_t count,
++                                   uint32_t *countRead,
++                                   nsAHttpTransaction *trans) { return NS_ERROR_FAILURE; };
++
++    // nsHttpPipeline::FillSendBuf needs to know if nsHttpConnection is using an SCTP socket.
++//  virtual bool IsSctpSocket(){ printf("nsAHttpSegmentReader IsSctpSocket?\n"); return  false; };
++virtual bool IsSctpSocket() { return false; };
++#endif
++
+ };
+ 
++
+ #define NS_DECL_NSAHTTPSEGMENTREADER \
+     nsresult OnReadSegment(const char *, uint32_t, uint32_t *) override;
+ 
+ //-----------------------------------------------------------------------------
+ // nsAHttpSegmentWriter
+ //-----------------------------------------------------------------------------
+ 
+ class nsAHttpSegmentWriter
+diff --git a/netwerk/protocol/http/nsHttpConnection.cpp b/netwerk/protocol/http/nsHttpConnection.cpp
+--- a/netwerk/protocol/http/nsHttpConnection.cpp
++++ b/netwerk/protocol/http/nsHttpConnection.cpp
+@@ -79,29 +79,56 @@ nsHttpConnection::nsHttpConnection()
+     , mPriority(nsISupportsPriority::PRIORITY_NORMAL)
+     , mReportedSpdy(false)
+     , mEverUsedSpdy(false)
+     , mLastHttpResponseVersion(NS_HTTP_VERSION_1_1)
+     , mTransactionCaps(0)
+     , mResponseTimeoutEnabled(false)
+     , mTCPKeepaliveConfig(kTCPKeepaliveDisabled)
+     , mForceSendPending(false)
++#if defined(ENABLE_SCTP)
++    , mNumberOfSctpStreams(0)
++    , mNextSctpInputStreamId(-1)
++#endif
+ {
+     LOG(("Creating nsHttpConnection @%p\n", this));
+ 
+     // the default timeout is for when this connection has not yet processed a
+     // transaction
+     static const PRIntervalTime k5Sec = PR_SecondsToInterval(5);
+     mIdleTimeout =
+         (k5Sec < gHttpHandler->IdleTimeout()) ? k5Sec : gHttpHandler->IdleTimeout();
+ }
+ 
+ nsHttpConnection::~nsHttpConnection()
+ {
+     LOG(("Destroying nsHttpConnection @%p\n", this));
++    printf("Destroying nsHttpConnection @%p\n", this);
++#if defined(ENABLE_SCTP)
++    for (int32_t i=mNumberOfSctpStreams-1; i>=0; i--) {
++        nsTArray<RefPtr<nsAHttpTransaction>> list;
++        list = static_cast<nsTArray<RefPtr<nsAHttpTransaction>>>
++                     (mStreamTransactionTable.ElementAt(i));
++        printf("List length for stream %d is %lu\n", i, list.Length());
++        if (list.IsEmpty()) {
++            printf("No transaction to delete on this SCTP stream\n");
++            continue;
++        } else {
++            while (!list.IsEmpty()) {
++                nsAHttpTransaction *thisTrans;
++                thisTrans = (nsAHttpTransaction*)list.ElementAt(0);
++                if (thisTrans) {
++                printf("list.RemoveElementAt(0)\n");
++                    list.RemoveElementAt(0);
++                printf("Element removed\n");
++                }
++            }
++        }
++    }   
++#endif
+ 
+     if (!mEverUsedSpdy) {
+         LOG(("nsHttpConnection %p performed %d HTTP/1.x transactions\n",
+              this, mHttp1xTransactionCount));
+         Telemetry::Accumulate(Telemetry::HTTP_REQUEST_PER_CONN,
+                               mHttp1xTransactionCount);
+     }
+ 
+@@ -350,17 +377,18 @@ nsHttpConnection::OnTunnelNudged(TLSFilt
+ 
+ // called on the socket thread
+ nsresult
+ nsHttpConnection::Activate(nsAHttpTransaction *trans, uint32_t caps, int32_t pri)
+ {
+     MOZ_ASSERT(PR_GetCurrentThread() == gSocketThread);
+     LOG(("nsHttpConnection::Activate [this=%p trans=%x caps=%x]\n",
+          this, trans, caps));
+-
++printf("nsHttpConnection::Activate [this=%p trans=%x caps=%x]\n",
++         this, trans, caps);
+     if (!trans->IsNullTransaction())
+         mExperienced = true;
+ 
+     mTransactionCaps = caps;
+     mPriority = pri;
+     if (mTransaction && mUsingSpdyVersion) {
+         return AddTransaction(trans, pri);
+     }
+@@ -1472,17 +1500,18 @@ nsHttpConnection::Version()
+ // nsHttpConnection <private>
+ //-----------------------------------------------------------------------------
+ 
+ void
+ nsHttpConnection::CloseTransaction(nsAHttpTransaction *trans, nsresult reason)
+ {
+     LOG(("nsHttpConnection::CloseTransaction[this=%p trans=%p reason=%x]\n",
+         this, trans, reason));
+-
++printf("nsHttpConnection::CloseTransaction[this=%p trans=%p reason=%x]\n",
++        this, trans, reason);
+     MOZ_ASSERT((trans == mTransaction) ||
+                (mTLSFilter && mTLSFilter->Transaction() == trans));
+     MOZ_ASSERT(PR_GetCurrentThread() == gSocketThread);
+ 
+     if (mCurrentBytesRead > mMaxBytesRead)
+         mMaxBytesRead = mCurrentBytesRead;
+ 
+     // mask this error code because its not a real error.
+@@ -1553,22 +1582,62 @@ nsHttpConnection::OnReadSegment(const ch
+         mSocketOutCondition = NS_OK; // reset condition
+         if (!mProxyConnectInProgress)
+             mTotalBytesWritten += *countRead;
+     }
+ 
+     return mSocketOutCondition;
+ }
+ 
++#if defined(ENABLE_SCTP)
++nsresult
++nsHttpConnection::OnReadSegment(const char *buf,
++                                uint32_t count,
++                                uint32_t *countRead,
++                                nsAHttpTransaction *trans)
++{
++printf("nsHttpConnection::SCTP: OnReadSegment count=%d\n", count);
++    if (count == 0) {
++        // some ReadSegments implementations will erroneously call the writer
++        // to consume 0 bytes worth of data.  we must protect against this case
++        // or else we'd end up closing the socket prematurely.
++        NS_ERROR("bad ReadSegments implementation");
++        return NS_ERROR_FAILURE; // stop iterating
++    }
++    // Must update mNextSctpOutputStreamId
++    int32_t sctpOutputStream;
++    nsresult sctpSocket = mSocketTransport->GetNextSctpOutputStreamId(&sctpOutputStream);
++printf("vor mSocketOut->Write\n");
++    nsresult rv = mSocketOut->Write(buf, count, countRead);
++printf("nach mSocketOut->Write\n");
++    if (NS_FAILED(rv)) {
++    printf("NS_FAILED(rv)\n");
++        mSocketOutCondition = rv;
++    } else if (*countRead == 0) {
++    printf("countRead == 0\n");
++        mSocketOutCondition = NS_BASE_STREAM_CLOSED;
++    } else if (NS_SUCCEEDED(sctpSocket)) {
++        // Add this transaction to the SCTP stream transaction table
++        printf("success\n");
++        mSocketOutCondition = AddSctpTransaction(sctpOutputStream, trans);
++    } else {
++    printf("NS_OK\n");
++        mSocketOutCondition = NS_OK; // reset condition
++    }
++
++    return mSocketOutCondition;
++}
++#endif
++
+ nsresult
+ nsHttpConnection::OnSocketWritable()
+ {
+     LOG(("nsHttpConnection::OnSocketWritable [this=%p] host=%s\n",
+          this, mConnInfo->Origin()));
+-
++printf("nsHttpConnection::OnSocketWritable()\n");
+     nsresult rv;
+     uint32_t transactionBytes;
+     bool again = true;
+ 
+     do {
+         rv = mSocketOutCondition = NS_OK;
+         transactionBytes = 0;
+ 
+@@ -1578,37 +1647,42 @@ nsHttpConnection::OnSocketWritable()
+         // negotiated with NPN/ALPN in the SSL handshake.
+ 
+         if (mConnInfo->UsingHttpsProxy() && !EnsureNPNComplete()) {
+             mSocketOutCondition = NS_BASE_STREAM_WOULD_BLOCK;
+         } else if (mProxyConnectStream) {
+             // If we're need an HTTP/1 CONNECT tunnel through a proxy
+             // send it before doing the SSL handshake
+             LOG(("  writing CONNECT request stream\n"));
++            printf("  writing CONNECT request stream\n");
+             rv = mProxyConnectStream->ReadSegments(ReadFromStream, this,
+                                                    nsIOService::gDefaultSegmentSize,
+                                                    &transactionBytes);
++            printf("return from mProxyConnectStream->ReadSegments with %d transactionBytes\n", transactionBytes);
+         } else if (!EnsureNPNComplete()) {
+             mSocketOutCondition = NS_BASE_STREAM_WOULD_BLOCK;
+         } else {
+ 
+             // for non spdy sessions let the connection manager know
+             if (!mReportedSpdy) {
+                 mReportedSpdy = true;
+                 MOZ_ASSERT(!mEverUsedSpdy);
+                 gHttpHandler->ConnMgr()->ReportSpdyConnection(this, false);
+             }
+-
+-            LOG(("  writing transaction request stream\n"));
++printf("  writing transaction request stream\n");
++            LOG(("  writing transaction request stream, read segments from pipeline\n"));
+             mProxyConnectInProgress = false;
+             rv = mTransaction->ReadSegments(this, nsIOService::gDefaultSegmentSize,
+                                             &transactionBytes);
++            printf("nsHttpConnection::OnSocketWritable transactionBytes=%d\n", transactionBytes);
+             mContentBytesWritten += transactionBytes;
+         }
+-
++printf("nsHttpConnection::OnSocketWritable %p "
++             "ReadSegments returned [rv=%x read=%u sock-cond=%x]\n",
++             this, rv, transactionBytes, mSocketOutCondition);
+         LOG(("nsHttpConnection::OnSocketWritable %p "
+              "ReadSegments returned [rv=%x read=%u sock-cond=%x]\n",
+              this, rv, transactionBytes, mSocketOutCondition));
+ 
+         // XXX some streams return NS_BASE_STREAM_CLOSED to indicate EOF.
+         if (rv == NS_BASE_STREAM_CLOSED && !mTransaction->IsDone()) {
+             rv = NS_OK;
+             transactionBytes = 0;
+@@ -1628,16 +1702,17 @@ nsHttpConnection::OnSocketWritable()
+                 } else {
+                     rv = mSocketOut->AsyncWait(this, 0, 0, nullptr); // continue writing
+                 }
+             } else {
+                 rv = mSocketOutCondition;
+             }
+             again = false;
+         } else if (!transactionBytes) {
++        printf("!transactionBytes\n");
+             rv = NS_OK;
+ 
+             if (mTransaction) { // in case the ReadSegments stack called CloseTransaction()
+                 //
+                 // at this point we've written out the entire transaction, and now we
+                 // must wait for the server's response.  we manufacture a status message
+                 // here to reflect the fact that we are waiting.  this message will be
+                 // trumped (overwritten) if the server responds quickly.
+@@ -1656,46 +1731,62 @@ nsHttpConnection::OnSocketWritable()
+     return rv;
+ }
+ 
+ nsresult
+ nsHttpConnection::OnWriteSegment(char *buf,
+                                  uint32_t count,
+                                  uint32_t *countWritten)
+ {
++printf("nsHttpConnection::OnWriteSegment\n");
+     if (count == 0) {
+         // some WriteSegments implementations will erroneously call the reader
+         // to provide 0 bytes worth of data.  we must protect against this case
+         // or else we'd end up closing the socket prematurely.
+         NS_ERROR("bad WriteSegments implementation");
++        printf("bad WriteSegments implementation\n");
+         return NS_ERROR_FAILURE; // stop iterating
+     }
+ 
+     if (ChaosMode::isActive(ChaosFeature::IOAmounts) &&
+         ChaosMode::randomUint32LessThan(2)) {
+         // read 1...count bytes
+         count = ChaosMode::randomUint32LessThan(count) + 1;
+     }
+ 
++#if defined(ENABLE_SCTP)
++    int32_t prevSctpInputStreamId = mNextSctpInputStreamId;
++#endif
++printf("vor mSocketIn->Read\n");
+     nsresult rv = mSocketIn->Read(buf, count, countWritten);
++printf("nach mSocketIn->Read, countWritten=%d\n", *countWritten);
+     if (NS_FAILED(rv))
+         mSocketInCondition = rv;
+     else if (*countWritten == 0)
+         mSocketInCondition = NS_BASE_STREAM_CLOSED;
+-    else
++    else {
+         mSocketInCondition = NS_OK; // reset condition
+ 
++#if defined(ENABLE_SCTP)
++        // Will SCTP input stream id change on next read?
++        if (mSocketTransport->GetNextSctpInputStreamId(&mNextSctpInputStreamId) != NS_ERROR_INVALID_SOCKET_TYPE)
++            if (prevSctpInputStreamId != mNextSctpInputStreamId) {
++                printf("SCTP input stream id will change on next read\n");
++                return NS_SCTP_INPUT_STREAM_ID_CHANGED;
++            }
++#endif
++    }
+     return mSocketInCondition;
+ }
+ 
+ nsresult
+ nsHttpConnection::OnSocketReadable()
+ {
+     LOG(("nsHttpConnection::OnSocketReadable [this=%p]\n", this));
+-
++printf("nsHttpConnection::OnSocketReadable()\n");
+     PRIntervalTime now = PR_IntervalNow();
+     PRIntervalTime delta = now - mLastReadTime;
+ 
+     // Reset mResponseTimeoutEnabled to stop response timeout checks.
+     mResponseTimeoutEnabled = false;
+ 
+     if (mKeepAliveMask && (delta >= mMaxHangTime)) {
+         LOG(("max hang time exceeded!\n"));
+@@ -1719,84 +1810,163 @@ nsHttpConnection::OnSocketReadable()
+         delta = 0;
+ 
+     static const PRIntervalTime k400ms  = PR_MillisecondsToInterval(400);
+ 
+     if (delta >= (mRtt + gHttpHandler->GetPipelineRescheduleTimeout())) {
+         LOG(("Read delta ms of %u causing slow read major "
+              "event and pipeline cancellation",
+              PR_IntervalToMilliseconds(delta)));
+-
++        printf("Read delta ms of %u causing slow read major "
++             "event and pipeline cancellation",
++             PR_IntervalToMilliseconds(delta));
+         gHttpHandler->ConnMgr()->PipelineFeedbackInfo(
+             mConnInfo, nsHttpConnectionMgr::BadSlowReadMajor, this, 0);
+ 
+         if (gHttpHandler->GetPipelineRescheduleOnTimeout() &&
+             mTransaction->PipelineDepth() > 1) {
+             nsHttpPipeline *pipeline = mTransaction->QueryPipeline();
+             MOZ_ASSERT(pipeline, "pipelinedepth > 1 without pipeline");
+             // code this defensively for the moment and check for null
+             // This will reschedule blocked members of the pipeline, but the
+             // blocking transaction (i.e. response 0) will not be changed.
+             if (pipeline) {
+                 pipeline->CancelPipeline(NS_ERROR_NET_TIMEOUT);
+                 LOG(("Rescheduling the head of line blocked members of a "
+                      "pipeline because reschedule-timeout idle interval "
+                      "exceeded"));
++                printf("Rescheduling the head of line blocked members of a "
++                     "pipeline because reschedule-timeout idle interval "
++                     "exceeded");
+             }
+         }
+     }
+     else if (delta > k400ms) {
+         gHttpHandler->ConnMgr()->PipelineFeedbackInfo(
+             mConnInfo, nsHttpConnectionMgr::BadSlowReadMinor, this, 0);
+     }
+ 
+     mLastReadTime = now;
+ 
+     nsresult rv;
+     uint32_t n;
+     bool again = true;
++   
++#if defined(ENABLE_SCTP)
++    nsAHttpTransaction *thisTransaction;
++    int32_t thisSctpInputStreamId;
++    nsresult sctpSocket;
++#endif
+ 
+     do {
+         if (!mProxyConnectInProgress && !mNPNComplete) {
+             // Unless we are setting up a tunnel via CONNECT, prevent reading
+             // from the socket until the results of NPN
+             // negotiation are known (which is determined from the write path).
+             // If the server speaks SPDY it is likely the readable data here is
+             // a spdy settings frame and without NPN it would be misinterpreted
+             // as HTTP/*
+ 
+             LOG(("nsHttpConnection::OnSocketReadable %p return due to inactive "
+                  "tunnel setup but incomplete NPN state\n", this));
+             rv = NS_OK;
+             break;
+         }
+ 
++#if defined(ENABLE_SCTP)
++        // Get valid SCTP stream id and update mSocketInCondition
++        printf("nsHttpConnection::OnSocketReadable()  SCTP\n");
++        sctpSocket = mSocketTransport->GetNextSctpInputStreamId(&mNextSctpInputStreamId);
++        printf("nextInputStreamId=%d\n", mNextSctpInputStreamId);
++        if (sctpSocket != NS_ERROR_INVALID_SOCKET_TYPE) {
++        printf("sctpSocket != NS_ERROR_INVALID_SOCKET_TYPE\n");
++            mSocketInCondition = sctpSocket;
++            if (NS_FAILED(mSocketInCondition)) {
++            printf("NS_FAILED(mSocketInCondition)\n");
++                // continue waiting for the socket if necessary...
++/*
++                if ((mSocketInCondition == NS_BASE_STREAM_WOULD_BLOCK) &&
++                     !(mTransaction->IsDone())) {
++*/
++                if (mSocketInCondition == NS_BASE_STREAM_WOULD_BLOCK) {
++                printf("NS_BASE_STREAM_WOULD_BLOCK\n");
++                    rv = mSocketIn->AsyncWait(this, 0, 0, nullptr);
++                } else
++                    rv = mSocketInCondition;
++printf("mSocketInCondition=%d\n", NS_ERROR_GET_CODE(mSocketInCondition));
++                break;
++            }
++printf("GetHeadTransaction for stream %d\n", mNextSctpInputStreamId);
++            GetHeadTransaction(mNextSctpInputStreamId, &thisTransaction);
++            if (!thisTransaction) {
++            printf("no head transaction found on stream %d\n", mNextSctpInputStreamId);
++                return NS_ERROR_UNEXPECTED;
++            } else
++            printf("found transaction %p\n", thisTransaction);
++
++            thisSctpInputStreamId = mNextSctpInputStreamId;
++            printf("thisstreamId=%d, mTransaction=%p\n", thisSctpInputStreamId, Transaction());
++            if(thisTransaction != mTransaction) {
++            printf("mTransaction is a pipeline\n");
++                // mTransaction is a pipeline
++                rv = mTransaction->WriteSegments(this, nsIOService::gDefaultSegmentSize,
++                                                 &n, thisTransaction);
++                
++                // nsHttpPipeline::WriteSegments returns NS_BASE_STREAM_CLOSED when
++                // thisTransaction is complete and closed.  Delete transaction table
++                // entry here.
++                if (rv == NS_BASE_STREAM_CLOSED) {
++                    DeleteHeadTransaction(thisSctpInputStreamId);
++                    // if pipeline is not done, return NS_OK
++                    if (!(mTransaction->IsDone()))
++                        rv = NS_OK;
++                }
++            }
++  	        else {
++  	        printf(" vor mTransaction->WriteSegments\n");
++                rv = mTransaction->WriteSegments(this, nsIOService::gDefaultSegmentSize, &n);
++            printf(" nach mTransaction->WriteSegments n=%d\n", n);
++                // return NS_BASE_STREAM_CLOSED here to close an individual transaction
++                // and delete transaction table entry.
++                printf("Is mTransaction done?\n");
++                if (mTransaction->IsDone()) {
++                printf("mTransaction is done: Delete Head Transaction\n");
++                    DeleteHeadTransaction(thisSctpInputStreamId);
++                    rv = NS_BASE_STREAM_CLOSED;
++                }
++            }
++        }
++        else
++#endif
+         rv = mTransaction->WriteSegments(this, nsIOService::gDefaultSegmentSize, &n);
++
+         if (NS_FAILED(rv)) {
++        printf("rv failed with rv=%d\n", NS_ERROR_GET_CODE(rv));
+             // if the transaction didn't want to take any more data, then
+             // wait for the transaction to call ResumeRecv.
+             if (rv == NS_BASE_STREAM_WOULD_BLOCK)
+                 rv = NS_OK;
+             again = false;
+-        }
+-        else {
++        } else {
+             mCurrentBytesRead += n;
+             mTotalBytesRead += n;
++            printf("mCurrentBytesRead=%d mTotalBytesRead=%d\n", mCurrentBytesRead, mTotalBytesRead);
+             if (NS_FAILED(mSocketInCondition)) {
+                 // continue waiting for the socket if necessary...
+                 if (mSocketInCondition == NS_BASE_STREAM_WOULD_BLOCK)
+                     rv = ResumeRecv();
+                 else
+                     rv = mSocketInCondition;
++                printf("set again=false\n");
+                 again = false;
+             }
+         }
+         // read more from the socket until error...
+     } while (again);
+-
++printf("OnSocketReadable left with rv=%d\n", NS_ERROR_GET_CODE(rv));
+     return rv;
+ }
+ 
+ void
+ nsHttpConnection::SetupSecondaryTLS()
+ {
+     MOZ_ASSERT(PR_GetCurrentThread() == gSocketThread);
+     MOZ_ASSERT(!mTLSFilter);
+@@ -1872,16 +2042,17 @@ nsHttpConnection::MakeConnectString(nsAH
+     result.AppendLiteral("\r\n");
+     return NS_OK;
+ }
+ 
+ nsresult
+ nsHttpConnection::SetupProxyConnect()
+ {
+     LOG(("nsHttpConnection::SetupProxyConnect [this=%p]\n", this));
++    printf("nsHttpConnection::SetupProxyConnect [this=%p]\n", this);
+     NS_ENSURE_TRUE(!mProxyConnectStream, NS_ERROR_ALREADY_INITIALIZED);
+     MOZ_ASSERT(!mUsingSpdyVersion,
+                "SPDY NPN Complete while using proxy connect stream");
+ 
+     nsAutoCString buf;
+     nsHttpRequestHead request;
+     nsresult rv = MakeConnectString(mTransaction, &request, buf);
+     if (NS_FAILED(rv)) {
+@@ -2096,16 +2267,26 @@ nsHttpConnection::OnOutputStreamReady(ns
+     MOZ_ASSERT(PR_GetCurrentThread() == gSocketThread);
+     MOZ_ASSERT(out == mSocketOut, "unexpected socket");
+     // if the transaction was dropped...
+     if (!mTransaction) {
+         LOG(("  no transaction; ignoring event\n"));
+         return NS_OK;
+     }
+ 
++#if defined(ENABLE_SCTP)
++    // Initialize stream transaction table if necessary
++    printf("nsHttpConnection::OnOutputStreamReady\n");
++    printf("mNumberOfSctpStreams=%d\n", mNumberOfSctpStreams);
++    if (mNumberOfSctpStreams == 0)
++        if (mSocketTransport->GetNumberOfSctpStreams(&mNumberOfSctpStreams) !=
++            NS_ERROR_INVALID_SOCKET_TYPE)
++            InitializeStreamTransactionTable();
++#endif
++
+     nsresult rv = OnSocketWritable();
+     if (NS_FAILED(rv))
+         CloseTransaction(mTransaction, rv);
+ 
+     return NS_OK;
+ }
+ 
+ //-----------------------------------------------------------------------------
+@@ -2147,16 +2328,126 @@ nsHttpConnection::GetInterface(const nsI
+         MutexAutoLock lock(mCallbacksLock);
+         callbacks = mCallbacks;
+     }
+     if (callbacks)
+         return callbacks->GetInterface(iid, result);
+     return NS_ERROR_NO_INTERFACE;
+ }
+ 
++//
++// Methods for maintaining the SCTP stream transaction table
++//
++//-----------------------------------------------------------------------------
++// nsHttpConnection::InitializeStreamTransactionTable
++//-----------------------------------------------------------------------------
++
++#if defined(ENABLE_SCTP)
++nsresult
++nsHttpConnection::InitializeStreamTransactionTable()	
++{
++printf("nsHttpConnection::InitializeStreamTransactionTable\n");
++    for (int32_t i=0; i<mNumberOfSctpStreams; i++) {
++        nsTArray<RefPtr<nsAHttpTransaction>> list;
++        mStreamTransactionTable.AppendElement(list);
++    }
++    return NS_OK;
++}
++
++//-----------------------------------------------------------------------------
++// nsHttpConnection::AddSctpTransaction
++//-----------------------------------------------------------------------------
++NS_IMETHODIMP
++nsHttpConnection::AddSctpTransaction(int32_t aSctpStreamId, nsAHttpTransaction* aTrans)
++{
++printf("nsHttpConnection::AddSctpTransaction: streamId=%d trans=%p\n", aSctpStreamId, aTrans);
++    NS_ENSURE_ARG_POINTER(aTrans);
++    NS_ASSERTION(aSctpStreamId  > -1 && aSctpStreamId < mNumberOfSctpStreams,
++                 "AddSctpTransaction: Invalid SCTP Stream ID");
++    //std::list<nsAHttpTransaction*> *transList;
++    nsTArray<RefPtr<nsAHttpTransaction>> list;
++    list = static_cast<nsTArray<RefPtr<nsAHttpTransaction>>>
++                     (mStreamTransactionTable.ElementAt(aSctpStreamId));
++    printf("Laenge list : %lu\n", list.Length());
++    list.AppendElement(aTrans);
++    printf("Laenge list nach Append: %lu\n", list.Length());
++    mStreamTransactionTable.ReplaceElementAt(aSctpStreamId, list);
++    return NS_OK;
++}
++
++//-----------------------------------------------------------------------------
++// nsHttpConnection::GetHeadTransaction
++//-----------------------------------------------------------------------------
++
++NS_IMETHODIMP
++nsHttpConnection::GetHeadTransaction(int32_t aSctpStreamId, nsAHttpTransaction** aTrans)
++{
++    NS_ASSERTION(aSctpStreamId > -1 && aSctpStreamId < mNumberOfSctpStreams,
++                 "GetHeadTransaction: Invalid SCTP Sttream ID");
++printf("nsHttpConnection::GetHeadTransaction: streamId=%d\n", aSctpStreamId);
++    *aTrans = nullptr;
++    nsTArray<RefPtr<nsAHttpTransaction>> list;
++    list = static_cast<nsTArray<RefPtr<nsAHttpTransaction>>>
++                     (mStreamTransactionTable.ElementAt(aSctpStreamId));
++    if (list.IsEmpty()) {
++        NS_ERROR("No transaction on this SCTP stream");
++    }
++    
++    *aTrans = (nsAHttpTransaction*)list.ElementAt(0);
++
++    if (!*aTrans)
++            NS_ERROR("No transaction on this SCTP stream");
++    else
++        printf("found transaction (*)%p, %p\n", *aTrans, aTrans);
++
++    return NS_OK;
++}
++
++//-----------------------------------------------------------------------------
++// nsHttpConnection::DeleteHeadTransaction
++//-----------------------------------------------------------------------------
++
++NS_IMETHODIMP
++nsHttpConnection::DeleteHeadTransaction(int32_t aSctpStreamId)
++{
++    NS_ASSERTION(aSctpStreamId > -1 && aSctpStreamId < mNumberOfSctpStreams,
++                 "DeleteTransaction: Invalid SCTPStream ID");
++printf("nsHttpConnection::DeleteHeadTransaction: streamId=%d\n", aSctpStreamId);
++    nsTArray<RefPtr<nsAHttpTransaction>> list;
++    list = static_cast<nsTArray<RefPtr<nsAHttpTransaction>>>
++                     (mStreamTransactionTable.ElementAt(aSctpStreamId));
++    if (list.IsEmpty()) {
++        NS_ERROR("No transaction to delete on this SCTP stream");
++    } else {
++        nsAHttpTransaction *thisTrans;
++        thisTrans = (nsAHttpTransaction*)list.ElementAt(0);
++        printf("remove Transaction %p\n", thisTrans);
++        if (thisTrans) {
++          //  NS_RELEASE(thisTrans);
++            list.RemoveElementAt(0);
++            mStreamTransactionTable.ReplaceElementAt(aSctpStreamId, list);
++        }
++    }
++    return NS_OK;
++}
++
++bool
++nsHttpConnection::IsSctpSocket()
++{
++    bool result;
++
++    result = false;
++    printf("nsHttpConnection::IsSctpSocket()\n");
++    if (mSocketTransport)
++        mSocketTransport->IsSctpSocket(&result); 	
++
++    return result;
++}
++#endif
++
+ void
+ nsHttpConnection::CheckForTraffic(bool check)
+ {
+     if (check) {
+         LOG((" CheckForTraffic conn %p\n", this));
+         if (mSpdySession) {
+             if (PR_IntervalToMilliseconds(IdleTime()) >= 500) {
+                 // Send a ping to verify it is still alive if it has been idle
+diff --git a/netwerk/protocol/http/nsHttpConnection.h b/netwerk/protocol/http/nsHttpConnection.h
+--- a/netwerk/protocol/http/nsHttpConnection.h
++++ b/netwerk/protocol/http/nsHttpConnection.h
+@@ -10,16 +10,18 @@
+ #include "nsAHttpTransaction.h"
+ #include "nsCOMPtr.h"
+ #include "nsAutoPtr.h"
+ #include "nsProxyRelease.h"
+ #include "prinrval.h"
+ #include "TunnelUtils.h"
+ #include "mozilla/Mutex.h"
+ #include "ARefBase.h"
++#include <list>
++#include <vector>
+ 
+ #include "nsIAsyncInputStream.h"
+ #include "nsIAsyncOutputStream.h"
+ #include "nsIInterfaceRequestor.h"
+ #include "nsITimer.h"
+ 
+ class nsISocketTransport;
+ class nsISSLSocketControl;
+@@ -212,16 +214,22 @@ public:
+     // connection since CheckForTraffic() was called.
+     bool NoTraffic() {
+         return mTrafficStamp &&
+             (mTrafficCount == (mTotalBytesWritten + mTotalBytesRead));
+     }
+     // override of nsAHttpConnection
+     virtual uint32_t Version();
+ 
++#if defined(ENABLE_SCTP)
++    nsresult OnReadSegment(const char *buf, uint32_t count, uint32_t *countRead,
++                                nsAHttpTransaction *trans);
++    bool IsSctpSocket();
++#endif
++
+ private:
+     // Value (set in mTCPKeepaliveConfig) indicates which set of prefs to use.
+     enum TCPKeepaliveConfig {
+       kTCPKeepaliveDisabled = 0,
+       kTCPKeepaliveShortLivedConfig,
+       kTCPKeepaliveLongLivedConfig
+     };
+ 
+@@ -345,16 +353,29 @@ private:
+     uint32_t                        mTransactionCaps;
+ 
+     bool                            mResponseTimeoutEnabled;
+ 
+     // Flag to indicate connection is in inital keepalive period (fast detect).
+     uint32_t                        mTCPKeepaliveConfig;
+     nsCOMPtr<nsITimer>              mTCPKeepaliveTransitionTimer;
+ 
++#if defined(ENABLE_SCTP)
++    // SCTP related members
++    nsTArray<nsTArray<RefPtr<nsAHttpTransaction>>> mStreamTransactionTable; // 2D array of stream numbers and the
++                                         //transactions assigned to them
++    int32_t     mNumberOfSctpStreams;
++    int32_t     mNextSctpInputStreamId;
++    nsresult    mSctpSocketInCondition;  // does the next message correspond
++                                         // to this transaction?
++    nsresult InitializeStreamTransactionTable();
++    nsresult AddSctpTransaction(PRInt32 aSctpStream, nsAHttpTransaction* aTrans);
++    nsresult GetHeadTransaction(PRInt32 aSctpStream, nsAHttpTransaction** aTrans);
++    nsresult DeleteHeadTransaction(PRInt32 aSctpStream);
++#endif
+ private:
+     // For ForceSend()
+     static void                     ForceSendIO(nsITimer *aTimer, void *aClosure);
+     nsresult                        MaybeForceSendIO();
+     bool                            mForceSendPending;
+     nsCOMPtr<nsITimer>              mForceSendTimer;
+ };
+ 
+diff --git a/netwerk/protocol/http/nsHttpConnectionMgr.cpp b/netwerk/protocol/http/nsHttpConnectionMgr.cpp
+--- a/netwerk/protocol/http/nsHttpConnectionMgr.cpp
++++ b/netwerk/protocol/http/nsHttpConnectionMgr.cpp
+@@ -328,17 +328,21 @@ nsHttpConnectionMgr::Observe(nsISupports
+ 
+ 
+ //-----------------------------------------------------------------------------
+ 
+ nsresult
+ nsHttpConnectionMgr::AddTransaction(nsHttpTransaction *trans, int32_t priority)
+ {
+     LOG(("nsHttpConnectionMgr::AddTransaction [trans=%p %d]\n", trans, priority));
++    printf("nsHttpConnectionMgr::AddTransaction [trans=%p %d]\n", trans, priority);
++    if (trans)
+     return PostEvent(&nsHttpConnectionMgr::OnMsgNewTransaction, priority, trans);
++    else
++    return NS_ERROR_FAILURE;
+ }
+ 
+ nsresult
+ nsHttpConnectionMgr::RescheduleTransaction(nsHttpTransaction *trans, int32_t priority)
+ {
+     LOG(("nsHttpConnectionMgr::RescheduleTransaction [trans=%p %d]\n", trans, priority));
+     return PostEvent(&nsHttpConnectionMgr::OnMsgReschedTransaction, priority, trans);
+ }
+@@ -1511,16 +1515,17 @@ nsHttpConnectionMgr::MakeNewConnection(n
+ }
+ 
+ bool
+ nsHttpConnectionMgr::AddToShortestPipeline(nsConnectionEntry *ent,
+                                            nsHttpTransaction *trans,
+                                            nsHttpTransaction::Classifier classification,
+                                            uint16_t depthLimit)
+ {
++printf("nsHttpConnectionMgr::AddToShortestPipeline\n");
+     if (classification == nsAHttpTransaction::CLASS_SOLO)
+         return false;
+ 
+     uint32_t maxdepth = ent->MaxPipelineDepth(classification);
+     if (maxdepth == 0) {
+         ent->CreditPenalty();
+         maxdepth = ent->MaxPipelineDepth(classification);
+     }
+@@ -1658,24 +1663,31 @@ nsHttpConnectionMgr::TryDispatchTransact
+     MOZ_ASSERT(PR_GetCurrentThread() == gSocketThread);
+     LOG(("nsHttpConnectionMgr::TryDispatchTransaction without conn "
+          "[trans=%p ci=%p ci=%s caps=%x tunnelprovider=%p onlyreused=%d "
+          "active=%d idle=%d]\n", trans,
+          ent->mConnInfo.get(), ent->mConnInfo->HashKey().get(),
+          uint32_t(trans->Caps()), trans->TunnelProvider(),
+          onlyReusedConnection, ent->mActiveConns.Length(),
+          ent->mIdleConns.Length()));
+-
++printf("nsHttpConnectionMgr::TryDispatchTransaction without conn "
++         "[trans=%p ci=%p ci=%s caps=%x tunnelprovider=%p onlyreused=%d "
++         "active=%d idle=%d]\n", trans,
++         ent->mConnInfo.get(), ent->mConnInfo->HashKey().get(),
++         uint32_t(trans->Caps()), trans->TunnelProvider(),
++         onlyReusedConnection, ent->mActiveConns.Length(),
++         ent->mIdleConns.Length());
+     nsHttpTransaction::Classifier classification = trans->Classification();
+     uint32_t caps = trans->Caps();
+ 
+     // no keep-alive means no pipelines either
+-    if (!(caps & NS_HTTP_ALLOW_KEEPALIVE))
++    if (!(caps & NS_HTTP_ALLOW_KEEPALIVE)) {
+         caps = caps & ~NS_HTTP_ALLOW_PIPELINING;
+-
++        printf("no pipelining\n");
++    }
+     // 0 - If this should use spdy then dispatch it post haste.
+     // 1 - If there is connection pressure then see if we can pipeline this on
+     //     a connection of a matching type instead of using a new conn
+     // 2 - If there is an idle connection, use it!
+     // 3 - if class == reval or script and there is an open conn of that type
+     //     then pipeline onto shortest pipeline of that class if limits allow
+     // 4 - If we aren't up against our connection limit,
+     //     then open a new one
+@@ -1692,16 +1704,17 @@ nsHttpConnectionMgr::TryDispatchTransact
+     // look for existing spdy connection - that's always best because it is
+     // essentially pipelining without head of line blocking
+ 
+     if (!(caps & NS_HTTP_DISALLOW_SPDY) && gHttpHandler->IsSpdyEnabled()) {
+         RefPtr<nsHttpConnection> conn = GetSpdyPreferredConn(ent);
+         if (conn) {
+             if ((caps & NS_HTTP_ALLOW_KEEPALIVE) || !conn->IsExperienced()) {
+                 LOG(("   dispatch to spdy: [conn=%p]\n", conn.get()));
++                printf("   dispatch to spdy: [conn=%p]\n", conn.get());
+                 trans->RemoveDispatchedAsBlocking();  /* just in case */
+                 DispatchTransaction(ent, trans, conn);
+                 return NS_OK;
+             }
+             unusedSpdyPersistentConnection = conn;
+         }
+     }
+ 
+@@ -1714,16 +1727,18 @@ nsHttpConnectionMgr::TryDispatchTransact
+             nsISchedulingContext *schedulingContext = trans->SchedulingContext();
+             if (schedulingContext) {
+                 uint32_t blockers = 0;
+                 if (NS_SUCCEEDED(schedulingContext->GetBlockingTransactionCount(&blockers)) &&
+                     blockers) {
+                     // need to wait for blockers to clear
+                     LOG(("   blocked by scheduling context: [sc=%p trans=%p blockers=%d]\n",
+                          schedulingContext, trans, blockers));
++                    printf("   blocked by scheduling context: [sc=%p trans=%p blockers=%d]\n",
++                         schedulingContext, trans, blockers);
+                     return NS_ERROR_NOT_AVAILABLE;
+                 }
+             }
+         }
+     } else {
+         // Mark the transaction and its load group as blocking right now to prevent
+         // other transactions from being reordered in the queue due to slow syns.
+         trans->DispatchedAsBlocking();
+@@ -1732,16 +1747,17 @@ nsHttpConnectionMgr::TryDispatchTransact
+     // step 1
+     // If connection pressure, then we want to favor pipelining of any kind
+     if (IsUnderPressure(ent, classification) && !attemptedOptimisticPipeline) {
+         attemptedOptimisticPipeline = true;
+         if (AddToShortestPipeline(ent, trans,
+                                   classification,
+                                   mMaxOptimisticPipelinedRequests)) {
+             LOG(("   dispatched step 1 trans=%p\n", trans));
++            printf("added to shortest pipeline   dispatched step 1 trans=%p\n", trans);
+             return NS_OK;
+         }
+     }
+ 
+     // Subject most transactions at high parallelism to rate pacing.
+     // It will only be actually submitted to the
+     // token bucket once, and if possible it is granted admission synchronously.
+     // It is important to leave a transaction in the pending queue when blocked by
+@@ -1757,16 +1773,17 @@ nsHttpConnectionMgr::TryDispatchTransact
+                 gHttpHandler->RequestTokenBucketMinParallelism()) {
+                 runNow = true; // white list it
+             } else if (caps & (NS_HTTP_LOAD_AS_BLOCKING | NS_HTTP_LOAD_UNBLOCKED)) {
+                 runNow = true; // white list it
+             }
+         }
+         if (!runNow) {
+             LOG(("   blocked due to rate pacing trans=%p\n", trans));
++            printf("   blocked due to rate pacing trans=%p\n", trans);
+             return NS_ERROR_NOT_AVAILABLE;
+         }
+     }
+ 
+     // step 2
+     // consider an idle persistent connection
+     if (caps & NS_HTTP_ALLOW_KEEPALIVE) {
+         RefPtr<nsHttpConnection> conn;
+@@ -1776,49 +1793,53 @@ nsHttpConnectionMgr::TryDispatchTransact
+             mNumIdleConns--;
+             nsHttpConnection *temp = conn;
+             NS_RELEASE(temp);
+ 
+             // we check if the connection can be reused before even checking if
+             // it is a "matching" connection.
+             if (!conn->CanReuse()) {
+                 LOG(("   dropping stale connection: [conn=%p]\n", conn.get()));
++                printf("   dropping stale connection: [conn=%p]\n", conn.get());
+                 conn->Close(NS_ERROR_ABORT);
+                 conn = nullptr;
+             }
+             else {
+                 LOG(("   reusing connection [conn=%p]\n", conn.get()));
++                printf("   reusing connection [conn=%p]\n", conn.get());
+                 conn->EndIdleMonitoring();
+             }
+ 
+             // If there are no idle connections left at all, we need to make
+             // sure that we are not pruning dead connections anymore.
+             ConditionallyStopPruneDeadConnectionsTimer();
+         }
+         if (conn) {
+             // This will update the class of the connection to be the class of
+             // the transaction dispatched on it.
+             AddActiveConn(conn, ent);
+             DispatchTransaction(ent, trans, conn);
+             LOG(("   dispatched step 2 (idle) trans=%p\n", trans));
++            printf("   dispatched step 2 (idle) trans=%p\n", trans);
+             return NS_OK;
+         }
+     }
+ 
+     // step 3
+     // consider pipelining scripts and revalidations
+     if (!attemptedOptimisticPipeline &&
+         (classification == nsHttpTransaction::CLASS_REVALIDATION ||
+          classification == nsHttpTransaction::CLASS_SCRIPT)) {
+         // Assignation kept here for documentation purpose; Never read after
+         attemptedOptimisticPipeline = true;
+         if (AddToShortestPipeline(ent, trans,
+                                   classification,
+                                   mMaxOptimisticPipelinedRequests)) {
+             LOG(("   dispatched step 3 (pipeline) trans=%p\n", trans));
++            printf("after AddToShortestPipeline   dispatched step 3 (pipeline) trans=%p\n", trans);
+             return NS_OK;
+         }
+     }
+ 
+     // step 4
+     if (!onlyReusedConnection) {
+         nsresult rv = MakeNewConnection(ent, trans);
+         if (NS_SUCCEEDED(rv)) {
+@@ -1826,59 +1847,65 @@ nsHttpConnectionMgr::TryDispatchTransact
+             LOG(("   dispatched step 4 (async new conn) trans=%p\n", trans));
+             return NS_ERROR_NOT_AVAILABLE;
+         }
+ 
+         if (rv != NS_ERROR_NOT_AVAILABLE) {
+             // not available return codes should try next step as they are
+             // not hard errors. Other codes should stop now
+             LOG(("   failed step 4 (%x) trans=%p\n", rv, trans));
++            printf("   failed step 4 (%x) trans=%p\n", rv, trans);
+             return rv;
+         }
+     } else if (trans->TunnelProvider() && trans->TunnelProvider()->MaybeReTunnel(trans)) {
+         LOG(("   sort of dispatched step 4a tunnel requeue trans=%p\n", trans));
++        printf("   sort of dispatched step 4a tunnel requeue trans=%p\n", trans);
+         // the tunnel provider took responsibility for making a new tunnel
+         return NS_OK;
+     }
+ 
+     // step 5
+     if (caps & NS_HTTP_ALLOW_PIPELINING) {
+         if (AddToShortestPipeline(ent, trans,
+                                   classification,
+                                   mMaxPipelinedRequests)) {
+             LOG(("   dispatched step 5 trans=%p\n", trans));
++            printf("   dispatched step 5 trans=%p\n", trans);
+             return NS_OK;
+         }
+     }
+ 
+     // step 6
+     if (unusedSpdyPersistentConnection) {
+         // to avoid deadlocks, we need to throw away this perfectly valid SPDY
+         // connection to make room for a new one that can service a no KEEPALIVE
+         // request
+         unusedSpdyPersistentConnection->DontReuse();
+     }
+ 
+     LOG(("   not dispatched (queued) trans=%p\n", trans));
++    printf("   not dispatched (queued) trans=%p\n", trans);
+     return NS_ERROR_NOT_AVAILABLE;                /* queue it */
+ }
+ 
+ nsresult
+ nsHttpConnectionMgr::DispatchTransaction(nsConnectionEntry *ent,
+                                          nsHttpTransaction *trans,
+                                          nsHttpConnection *conn)
+ {
+     uint32_t caps = trans->Caps();
+     int32_t priority = trans->Priority();
+     nsresult rv;
+ 
+     LOG(("nsHttpConnectionMgr::DispatchTransaction "
+          "[ent-ci=%s %p trans=%p caps=%x conn=%p priority=%d]\n",
+          ent->mConnInfo->HashKey().get(), ent, trans, caps, conn, priority));
+-
++printf("nsHttpConnectionMgr::DispatchTransaction "
++         "[ent-ci=%s %p trans=%p caps=%x conn=%p priority=%d]\n",
++         ent->mConnInfo->HashKey().get(), ent, trans, caps, conn, priority);
+     // It is possible for a rate-paced transaction to be dispatched independent
+     // of the token bucket when the amount of parallelization has changed or
+     // when a muxed connection (e.g. spdy or pipelines) becomes available.
+     trans->CancelPacing(NS_OK);
+ 
+     if (conn->UsingSpdy()) {
+         LOG(("Spdy Dispatch Transaction via Activate(). Transaction host = %s, "
+              "Connection host = %s\n",
+@@ -1966,46 +1993,51 @@ nsHttpConnectionMgr::DispatchAbstractTra
+                                                  nsHttpConnection *conn,
+                                                  int32_t priority)
+ {
+     MOZ_ASSERT(!conn->UsingSpdy(),
+                "Spdy Must Not Use DispatchAbstractTransaction");
+     LOG(("nsHttpConnectionMgr::DispatchAbstractTransaction "
+          "[ci=%s trans=%p caps=%x conn=%p]\n",
+          ent->mConnInfo->HashKey().get(), aTrans, caps, conn));
+-
++printf("nsHttpConnectionMgr::DispatchAbstractTransaction "
++         "[ci=%s trans=%p caps=%x conn=%p]\n",
++         ent->mConnInfo->HashKey().get(), aTrans, caps, conn);
+     /* Use pipeline datastructure even if connection does not currently qualify
+        to pipeline this transaction because a different pipeline-eligible
+        transaction might be placed on the active connection. Make an exception
+        for CLASS_SOLO as that connection will never pipeline until it goes
+        quiescent */
+ 
+     RefPtr<nsAHttpTransaction> transaction;
+     nsresult rv;
+     if (conn->Classification() != nsAHttpTransaction::CLASS_SOLO) {
+         LOG(("   using pipeline datastructure.\n"));
++        printf("   using pipeline datastructure.\n");
+         RefPtr<nsHttpPipeline> pipeline;
+         rv = BuildPipeline(ent, aTrans, getter_AddRefs(pipeline));
+         if (!NS_SUCCEEDED(rv))
+             return rv;
+         transaction = pipeline;
+     }
+     else {
+         LOG(("   not using pipeline datastructure due to class solo.\n"));
++        printf("   not using pipeline datastructure due to class solo.\n");
+         transaction = aTrans;
+     }
+ 
+     RefPtr<ConnectionHandle> handle = new ConnectionHandle(conn);
+ 
+     // give the transaction the indirect reference to the connection.
+     transaction->SetConnection(handle);
+ 
+     rv = conn->Activate(transaction, caps, priority);
+     if (NS_FAILED(rv)) {
+         LOG(("  conn->Activate failed [rv=%x]\n", rv));
++        printf("  conn->Activate failed [rv=%x]\n", rv);
+         ent->mActiveConns.RemoveElement(conn);
+         if (conn == ent->mYellowConnection)
+             ent->OnYellowComplete();
+         DecrementActiveConnCount(conn);
+         ConditionallyStopTimeoutTick();
+ 
+         // sever back references to connection, and do so without triggering
+         // a call to ReclaimConnection ;-)
+@@ -2024,24 +2056,25 @@ nsHttpConnectionMgr::DispatchAbstractTra
+ }
+ 
+ nsresult
+ nsHttpConnectionMgr::BuildPipeline(nsConnectionEntry *ent,
+                                    nsAHttpTransaction *firstTrans,
+                                    nsHttpPipeline **result)
+ {
+     MOZ_ASSERT(PR_GetCurrentThread() == gSocketThread);
+-
++printf("BuildPipeline\n");
+     /* form a pipeline here even if nothing is pending so that we
+        can stream-feed it as new transactions arrive */
+ 
+     /* the first transaction can go in unconditionally - 1 transaction
+        on a nsHttpPipeline object is not a real HTTP pipeline */
+ 
+     RefPtr<nsHttpPipeline> pipeline = new nsHttpPipeline();
++    printf("Add transaction to pipeline\n");
+     pipeline->AddTransaction(firstTrans);
+     pipeline.forget(result);
+     return NS_OK;
+ }
+ 
+ void
+ nsHttpConnectionMgr::ReportProxyTelemetry(nsConnectionEntry *ent)
+ {
+@@ -2056,17 +2089,17 @@ nsHttpConnectionMgr::ReportProxyTelemetr
+     else
+         Telemetry::Accumulate(Telemetry::HTTP_PROXY_TYPE, PROXY_SOCKS);
+ }
+ 
+ nsresult
+ nsHttpConnectionMgr::ProcessNewTransaction(nsHttpTransaction *trans)
+ {
+     MOZ_ASSERT(PR_GetCurrentThread() == gSocketThread);
+-
++printf("nsHttpConnectionMgr::ProcessNewTransaction %p\n", trans);
+     // since "adds" and "cancels" are processed asynchronously and because
+     // various events might trigger an "add" directly on the socket thread,
+     // we must take care to avoid dispatching a transaction that has already
+     // been canceled (see bug 190001).
+     if (NS_FAILED(trans->Status())) {
+         LOG(("  transaction was canceled... dropping event!\n"));
+         return NS_OK;
+     }
+@@ -2122,30 +2155,36 @@ nsHttpConnectionMgr::ProcessNewTransacti
+             // unknown fresh connection
+             MOZ_ASSERT(static_cast<int32_t>(ent->mIdleConns.IndexOf(conn)) == -1);
+             MOZ_ASSERT(!conn->IsExperienced());
+ 
+             AddActiveConn(conn, ent); // make it active
+         }
+ 
+         trans->SetConnection(nullptr);
++        printf("call DispatchTransaction trans=%p\n", trans);
+         rv = DispatchTransaction(ent, trans, conn);
+     } else {
++    printf("call TryDispatchTransaction trans=%p\n", trans);
+         rv = TryDispatchTransaction(ent, !!trans->TunnelProvider(), trans);
+     }
+ 
+     if (NS_SUCCEEDED(rv)) {
+         LOG(("  ProcessNewTransaction Dispatch Immediately trans=%p\n", trans));
++        printf("  ProcessNewTransaction Dispatch Immediately trans=%p\n", trans);
+         return rv;
+     }
+ 
+     if (rv == NS_ERROR_NOT_AVAILABLE) {
+         LOG(("  adding transaction to pending queue "
+              "[trans=%p pending-count=%u]\n",
+              trans, ent->mPendingQ.Length()+1));
++          printf("  adding transaction to pending queue "
++             "[trans=%p pending-count=%u]\n",
++             trans, ent->mPendingQ.Length()+1);
+         // put this transaction on the pending queue...
+         InsertTransactionSorted(ent->mPendingQ, trans);
+         NS_ADDREF(trans);
+         return NS_OK;
+     }
+ 
+     LOG(("  ProcessNewTransaction Hard Error trans=%p rv=%x\n", trans, rv));
+     return rv;
+@@ -2361,17 +2400,17 @@ nsHttpConnectionMgr::OnMsgShutdownConfir
+     BoolWrapper *shutdown = static_cast<BoolWrapper *>(param);
+     shutdown->mBool = true;
+ }
+ 
+ void
+ nsHttpConnectionMgr::OnMsgNewTransaction(int32_t priority, ARefBase *param)
+ {
+     LOG(("nsHttpConnectionMgr::OnMsgNewTransaction [trans=%p]\n", param));
+-
++printf("nsHttpConnectionMgr::OnMsgNewTransaction [trans=%p]\n", param);
+     nsHttpTransaction *trans = static_cast<nsHttpTransaction *>(param);
+     trans->SetPriority(priority);
+     nsresult rv = ProcessNewTransaction(trans);
+     if (NS_FAILED(rv))
+         trans->Close(rv); // for whatever its worth
+ }
+ 
+ void
+diff --git a/netwerk/protocol/http/nsHttpPipeline.cpp b/netwerk/protocol/http/nsHttpPipeline.cpp
+--- a/netwerk/protocol/http/nsHttpPipeline.cpp
++++ b/netwerk/protocol/http/nsHttpPipeline.cpp
+@@ -85,21 +85,22 @@ nsHttpPipeline::~nsHttpPipeline()
+     if (mPushBackBuf)
+         free(mPushBackBuf);
+ }
+ 
+ nsresult
+ nsHttpPipeline::AddTransaction(nsAHttpTransaction *trans)
+ {
+     LOG(("nsHttpPipeline::AddTransaction [this=%p trans=%x]\n", this, trans));
+-
++printf("nsHttpPipeline::AddTransaction [this=%p trans=%x]\n", this, trans);
+     if (mRequestQ.Length() || mResponseQ.Length())
+         mUtilizedPipeline = true;
+ 
+     NS_ADDREF(trans);
++    printf("mRequestQ.AppendElement(trans);\n");
+     mRequestQ.AppendElement(trans);
+     uint32_t qlen = PipelineDepth();
+ 
+     if (qlen != 1) {
+         trans->SetPipelinePosition(qlen);
+     }
+     else {
+         // do it for this case in case an idempotent cancellation
+@@ -201,38 +202,43 @@ nsHttpPipeline::OnHeadersAvailable(nsAHt
+     return rv;
+ }
+ 
+ void
+ nsHttpPipeline::CloseTransaction(nsAHttpTransaction *trans, nsresult reason)
+ {
+     LOG(("nsHttpPipeline::CloseTransaction [this=%p trans=%x reason=%x]\n",
+         this, trans, reason));
++            printf("nsHttpPipeline::CloseTransaction [this=%p trans=%x reason=%x]\n",
++        this, trans, reason);
+ 
+     MOZ_ASSERT(PR_GetCurrentThread() == gSocketThread);
+     MOZ_ASSERT(NS_FAILED(reason), "expecting failure code");
+ 
+     // the specified transaction is to be closed with the given "reason"
+ 
+     int32_t index;
+     bool killPipeline = false;
+ 
+     index = mRequestQ.IndexOf(trans);
+     if (index >= 0) {
+         if (index == 0 && mRequestIsPartial) {
+             // the transaction is in the request queue.  check to see if any of
+             // its data has been written out yet.
+             killPipeline = true;
+         }
++        printf("mRequestQ.RemoveElementAt(%d\n", index);
+         mRequestQ.RemoveElementAt(index);
+     }
+     else {
+         index = mResponseQ.IndexOf(trans);
+-        if (index >= 0)
++        if (index >= 0) {
++        printf("mResponseQ.RemoveElementAt(%d\n", index);
+             mResponseQ.RemoveElementAt(index);
++        }
+         // while we could avoid killing the pipeline if this transaction is the
+         // last transaction in the pipeline, there doesn't seem to be that much
+         // value in doing so.  most likely if this transaction is going away,
+         // the others will be shortly as well.
+         killPipeline = true;
+     }
+ 
+     // Marking this connection as non-reusable prevents other items from being
+@@ -354,33 +360,35 @@ nsHttpPipeline::SetProxyConnectFailed()
+     if (trans)
+         trans->SetProxyConnectFailed();
+ }
+ 
+ nsHttpRequestHead *
+ nsHttpPipeline::RequestHead()
+ {
+     nsAHttpTransaction *trans = Request(0);
+-
++printf("RequestHead: got trans=%p\n", trans);
+     if (trans)
+         return trans->RequestHead();
+     return nullptr;
+ }
+ 
+ uint32_t
+ nsHttpPipeline::Http1xTransactionCount()
+ {
+   return mHttp1xTransactionCount;
+ }
+ 
+ nsresult
+ nsHttpPipeline::TakeSubTransactions(
+     nsTArray<RefPtr<nsAHttpTransaction> > &outTransactions)
+ {
+     LOG(("nsHttpPipeline::TakeSubTransactions [this=%p]\n", this));
++    printf("nsHttpPipeline::TakeSubTransactions [this=%p]\n", this);
++
+ 
+     if (mResponseQ.Length() || mRequestIsPartial)
+         return NS_ERROR_ALREADY_OPENED;
+ 
+     int32_t i, count = mRequestQ.Length();
+     for (i = 0; i < count; ++i) {
+         nsAHttpTransaction *trans = Request(i);
+         // set the transaction conneciton object back to the underlying
+@@ -439,16 +447,18 @@ nsHttpPipeline::GetSecurityCallbacks(nsI
+ }
+ 
+ void
+ nsHttpPipeline::OnTransportStatus(nsITransport* transport,
+                                   nsresult status, int64_t progress)
+ {
+     LOG(("nsHttpPipeline::OnStatus [this=%p status=%x progress=%lld]\n",
+         this, status, progress));
++    printf("nsHttpPipeline::OnStatus [this=%p status=%x progress=%lld]\n",
++        this, status, progress);
+ 
+     MOZ_ASSERT(PR_GetCurrentThread() == gSocketThread);
+ 
+     nsAHttpTransaction *trans;
+     int32_t i, count;
+ 
+     switch (status) {
+ 
+@@ -478,16 +488,17 @@ nsHttpPipeline::OnTransportStatus(nsITra
+ 
+         if (mSuppressSendEvents) {
+             mSuppressSendEvents = false;
+ 
+             // catch up by sending the event to all the transactions that have
+             // moved from request to response and any that have been partially
+             // sent. Also send WAITING_FOR to those that were completely sent
+             count = mResponseQ.Length();
++            printf("nsHttpPipeline::OnTransportStatus count=%d\n", count);
+             for (i = 0; i < count; ++i) {
+                 Response(i)->OnTransportStatus(transport,
+                                                NS_NET_STATUS_SENDING_TO,
+                                                progress);
+                 Response(i)->OnTransportStatus(transport,
+                                                NS_NET_STATUS_WAITING_FOR,
+                                                progress);
+             }
+@@ -508,16 +519,17 @@ nsHttpPipeline::OnTransportStatus(nsITra
+         // ignore it
+         break;
+ 
+     case NS_NET_STATUS_RECEIVING_FROM:
+         // Forward this only to the transaction currently recieving data. It is
+         // normally generated by the socket transport, but can also
+         // be repeated by the pushbackwriter if necessary.
+         mReceivingFromProgress = progress;
++        printf("NS_NET_STATUS_RECEIVING_FROM\n");
+         if (Response(0))
+             Response(0)->OnTransportStatus(transport, status, progress);
+         break;
+ 
+     default:
+         // forward other notifications to all request transactions
+         count = mRequestQ.Length();
+         for (i = 0; i < count; ++i)
+@@ -594,113 +606,130 @@ NS_METHOD
+ nsHttpPipeline::ReadFromPipe(nsIInputStream *stream,
+                              void *closure,
+                              const char *buf,
+                              uint32_t offset,
+                              uint32_t count,
+                              uint32_t *countRead)
+ {
+     nsHttpPipeline *self = (nsHttpPipeline *) closure;
++printf("nsHttpPipeline::ReadFromPipe\n");
++#if defined(ENABLE_SCTP)
++    // Pass transaction for maintaining SCTP stream transaction table
++    return self->mReader->OnReadSegment(buf, count, countRead,
++                                        self->mCurrentReadTransaction);
++#else
+     return self->mReader->OnReadSegment(buf, count, countRead);
++#endif
++    return NS_OK;
+ }
+ 
+ nsresult
+ nsHttpPipeline::ReadSegments(nsAHttpSegmentReader *reader,
+                              uint32_t count,
+                              uint32_t *countRead)
+ {
+     LOG(("nsHttpPipeline::ReadSegments [this=%p count=%u]\n", this, count));
+-
++printf("nsHttpPipeline::ReadSegments\n");
+     MOZ_ASSERT(PR_GetCurrentThread() == gSocketThread);
+ 
+     if (mClosed) {
+         *countRead = 0;
+         return mStatus;
+     }
+ 
+     nsresult rv;
+     uint64_t avail = 0;
+     if (mSendBufIn) {
++    printf("mSendBufIn\n");
+         rv = mSendBufIn->Available(&avail);
+         if (NS_FAILED(rv)) return rv;
+     }
+ 
++    // FillSendBuf needs mReader to be initialized
++    mReader = reader;
++
+     if (avail == 0) {
++    printf("avail=0; go and fill send buf\n");
+         rv = FillSendBuf();
++        printf("returned from fillsendBuf\n");
+         if (NS_FAILED(rv)) return rv;
+ 
+         rv = mSendBufIn->Available(&avail);
+         if (NS_FAILED(rv)) return rv;
+ 
+         // return EOF if send buffer is empty
+         if (avail == 0) {
+             *countRead = 0;
+             return NS_OK;
+         }
+     }
+ 
+     // read no more than what was requested
+     if (avail > count)
+         avail = count;
+ 
+-    mReader = reader;
+-
+     // avail is under 4GB, so casting to uint32_t is safe
+     rv = mSendBufIn->ReadSegments(ReadFromPipe, this, (uint32_t)avail, countRead);
+ 
+     mReader = nullptr;
+     return rv;
+ }
+ 
+ nsresult
+ nsHttpPipeline::WriteSegments(nsAHttpSegmentWriter *writer,
+                               uint32_t count,
+                               uint32_t *countWritten)
+ {
+     LOG(("nsHttpPipeline::WriteSegments [this=%p count=%u]\n", this, count));
+-
++printf("nsHttpPipeline::TCP WriteSegments\n");
+     MOZ_ASSERT(PR_GetCurrentThread() == gSocketThread);
+ 
+     if (mClosed)
+         return NS_SUCCEEDED(mStatus) ? NS_BASE_STREAM_CLOSED : mStatus;
+ 
+     nsAHttpTransaction *trans;
+     nsresult rv;
+ 
+     trans = Response(0);
++    printf("trans (%p) = Response(0)\n", trans);
+     // This code deals with the establishment of a CONNECT tunnel through
+     // an HTTP proxy. It allows the connection to do the CONNECT/200
+     // HTTP transaction to establish a tunnel as a precursor to the
+     // actual pipeline of regular HTTP transactions.
+     if (!trans && mRequestQ.Length() &&
+         mConnection->IsProxyConnectInProgress()) {
+         LOG(("nsHttpPipeline::WriteSegments [this=%p] Forced Delegation\n",
+              this));
++        printf("nsHttpPipeline::WriteSegments [this=%p] Forced Delegation, set trans=Request(0)\n",
++             this);
+         trans = Request(0);
+     }
+ 
+     if (!trans) {
+         if (mRequestQ.Length() > 0)
+             rv = NS_BASE_STREAM_WOULD_BLOCK;
+         else
+             rv = NS_BASE_STREAM_CLOSED;
+     }
+     else {
+         //
+         // ask the transaction to consume data from the connection.
+         // PushBack may be called recursively.
+         //
++        printf("PIP: call trans->WriteSegments\n");
+         rv = trans->WriteSegments(writer, count, countWritten);
+-
++        printf("PIP: return from  trans->WriteSegments with countWritten=%d\n", countWritten);
+         if (rv == NS_BASE_STREAM_CLOSED || trans->IsDone()) {
+             trans->Close(NS_OK);
+ 
+             // Release the transaction if it is not IsProxyConnectInProgress()
+             if (trans == Response(0)) {
+                 NS_RELEASE(trans);
++                printf("PIP: mResponseQ.RemoveElementAt(0)\n");
+                 mResponseQ.RemoveElementAt(0);
+                 mResponseIsPartial = false;
+                 ++mHttp1xTransactionCount;
+             }
+ 
+             // ask the connection manager to add additional transactions
+             // to our pipeline.
+             RefPtr<nsHttpConnectionInfo> ci;
+@@ -708,16 +737,17 @@ nsHttpPipeline::WriteSegments(nsAHttpSeg
+             if (ci)
+                 gHttpHandler->ConnMgr()->ProcessPendingQForEntry(ci);
+         }
+         else
+             mResponseIsPartial = true;
+     }
+ 
+     if (mPushBackLen) {
++    printf("PIP: mPushBackLen=%d\n", mPushBackLen);
+         nsHttpPushBackWriter writer(mPushBackBuf, mPushBackLen);
+         uint32_t len = mPushBackLen, n;
+         mPushBackLen = 0;
+ 
+         // This progress notification has previously been sent from
+         // the socket transport code, but it was delivered to the
+         // previous transaction on the pipeline.
+         nsITransport *transport = Transport();
+@@ -729,16 +759,72 @@ nsHttpPipeline::WriteSegments(nsAHttpSeg
+         // so we are guaranteed that the next response will eat the entire
+         // push back buffer (even though it might again call PushBack).
+         rv = WriteSegments(&writer, len, &n);
+     }
+ 
+     return rv;
+ }
+ 
++#if defined(ENABLE_SCTP)
++nsresult 	
++nsHttpPipeline::WriteSegments(nsAHttpSegmentWriter *writer,
++                              uint32_t count,
++                              uint32_t *countWritten,
++                              nsAHttpTransaction *trans)
++{
++    LOG(("nsHttpPipeline::WriteSegments [this=%x count=%u]\n", this, count));
++printf("nsHttpPipeline::SCTP WriteSegments\n");
++    NS_ASSERTION(PR_GetCurrentThread() == gSocketThread, "wrong thread");
++
++    if (mClosed)
++        return NS_SUCCEEDED(mStatus) ? NS_BASE_STREAM_CLOSED : mStatus;
++
++    nsresult rv;
++
++    NS_ASSERTION(trans, "Transaction should never be null here");
++
++
++    //
++    // ask the transaction to consume data from the connection. 	
++    // PushBack may be called recursively.
++    //
++    printf("call trans->WriteSegments\n");
++    rv = trans->WriteSegments(writer, count, countWritten);
++printf("return from trans->WriteSegments with countWritten=%d\n", *countWritten);
++    if (rv == NS_BASE_STREAM_CLOSED || trans->IsDone()) {
++        trans->Close(NS_OK);
++        rv = NS_BASE_STREAM_CLOSED;    // Notifies writer that trans is closed.
++        printf("NS_BASE_STREAM_CLOSED || trans->IsDone(): mResponseQ.RemoveElement(trans=%p)\n", trans);
++        mResponseQ.RemoveElement(trans);
++        NS_RELEASE(trans);
++        mResponseIsPartial = false;
++
++        // ask the connection manager to add additional transactions
++        // to our pipeline.
++        gHttpHandler->ConnMgr()->AddTransaction((nsHttpTransaction *)trans, 0);
++    }
++    else
++        mResponseIsPartial = true;
++
++    if (mPushBackLen) {
++    printf("mPushBackLen = %d\n", mPushBackLen);
++        nsHttpPushBackWriter writer(mPushBackBuf, mPushBackLen);
++        uint32_t len = mPushBackLen, n;
++        mPushBackLen = 0;
++        // the push back buffer is never larger than NS_HTTP_SEGMENT_SIZE,
++        // so we are guaranteed that the next response will eat the entire
++        // push back buffer (even though it might again call PushBack).
++        rv = WriteSegments(&writer, len, &n, trans);
++    }
++
++    return rv;
++}
++#endif
++
+ uint32_t
+ nsHttpPipeline::CancelPipeline(nsresult originalReason)
+ {
+     uint32_t i, reqLen, respLen, total;
+     nsAHttpTransaction *trans;
+ 
+     reqLen = mRequestQ.Length();
+     respLen = mResponseQ.Length();
+@@ -833,51 +919,88 @@ nsHttpPipeline::Close(nsresult reason)
+ nsresult
+ nsHttpPipeline::OnReadSegment(const char *segment,
+                               uint32_t count,
+                               uint32_t *countRead)
+ {
+     return mSendBufOut->Write(segment, count, countRead);
+ }
+ 
++ 	
++#if defined(ENABLE_SCTP)
++nsresult
++nsHttpPipeline::OnReadSegment(const char *segment,
++                              uint32_t count,
++                              uint32_t *countRead,
++                              nsAHttpTransaction *trans)
++{
++printf("nsHttpPipeline::SCTP OnReadSegment\n");
++    // just a wrapper for HttpPipeline
++  //  return OnReadSegment(segment, count, countRead);
++    return mSendBufOut->Write(segment, count, countRead);
++}
++#endif
++
+ nsresult
+ nsHttpPipeline::FillSendBuf()
+ {
+     // reads from request queue, moving transactions to response queue
+     // when they have been completely read.
+ 
+     nsresult rv;
+ 
+     if (!mSendBufIn) {
++    printf("!mSendBufIn\n");
+         // allocate a single-segment pipe
+         rv = NS_NewPipe(getter_AddRefs(mSendBufIn),
+                         getter_AddRefs(mSendBufOut),
+                         nsIOService::gDefaultSegmentSize,  /* segment size */
+                         nsIOService::gDefaultSegmentSize,  /* max size */
+                         true, true);
+         if (NS_FAILED(rv)) return rv;
+     }
+ 
+     uint32_t n;
+     uint64_t avail;
+     nsAHttpTransaction *trans;
+     nsITransport *transport = Transport();
+ 
+     while ((trans = Request(0)) != nullptr) {
++
++#if defined(ENABLE_SCTP)
++        mCurrentReadTransaction = trans;
++#endif
++
+         avail = trans->Available();
+         if (avail) {
+             // if there is already a response in the responseq then this
+             // new data comprises a pipeline. Update the transaction in the
+             // response queue to reflect that if necessary. We are now sending
+             // out a request while we haven't received all responses.
+             nsAHttpTransaction *response = Response(0);
+             if (response && !response->PipelinePosition())
+                 response->SetPipelinePosition(1);
+-            rv = trans->ReadSegments(this, (uint32_t)std::min(avail, (uint64_t)UINT32_MAX), &n);
+-            if (NS_FAILED(rv)) return rv;
++
++#if defined(ENABLE_SCTP)
++printf("nsHttpPipeline::FillSendBuf SCTP enabled\n");
++            // SCTP transactions must be written to socket separately.
++           if (mReader && mReader->IsSctpSocket()) {
++            printf("is Sctp socket\n");
++                rv = trans->ReadSegments(mReader, avail, &n);
++            } else {
++                printf("no sctp socket\n");
++#endif  
++                rv = trans->ReadSegments(this, avail, &n);
++#if defined(ENABLE_SCTP)
++            }
++#endif
++            if (NS_FAILED(rv)) {
++                printf("trans->ReadSegments failed\n");
++                return rv;
++            }
+ 
+             if (n == 0) {
+                 LOG(("send pipe is full"));
+                 break;
+             }
+ 
+             mSendingToProgress += n;
+             if (!mSuppressSendEvents && transport) {
+@@ -886,31 +1009,47 @@ nsHttpPipeline::FillSendBuf()
+                                          NS_NET_STATUS_SENDING_TO,
+                                          mSendingToProgress);
+             }
+         }
+ 
+         avail = trans->Available();
+         if (avail == 0) {
+             // move transaction from request queue to response queue
++            printf("mRequestQ.RemoveElementAt(0)\n");
+             mRequestQ.RemoveElementAt(0);
++            printf("mResponseQ.AppendElement(trans)\n");
+             mResponseQ.AppendElement(trans);
+             mRequestIsPartial = false;
+ 
+             if (!mSuppressSendEvents && transport) {
+                 // Simulate a WAITING_FOR event
+                 trans->OnTransportStatus(transport,
+                                          NS_NET_STATUS_WAITING_FOR,
+                                          mSendingToProgress);
+             }
+ 
++#if defined(ENABLE_SCTP)
++            mCurrentReadTransaction = nullptr;
++#endif
++
+             // It would be good to re-enable data read handlers via ResumeRecv()
+             // except the read handler code can be synchronously dispatched on
+             // the stack.
+         }
+         else
+             mRequestIsPartial = true;
+     }
+     return NS_OK;
+ }
+ 
++#if defined(ENABLE_SCTP)
++bool
++nsHttpPipeline::IsSctpSocket()
++{
++printf("nsHttpPipeline::IsSctpSocket()\n");
++    // IsSctpSocket is meant to query connections, not pipelines.
++    return false;
++}
++#endif
++
+ } // namespace net
+ } // namespace mozilla
+diff --git a/netwerk/protocol/http/nsHttpPipeline.h b/netwerk/protocol/http/nsHttpPipeline.h
+--- a/netwerk/protocol/http/nsHttpPipeline.h
++++ b/netwerk/protocol/http/nsHttpPipeline.h
+@@ -76,16 +76,23 @@ private:
+ 
+     // indicates whether or not a true pipeline (more than 1 request without
+     // a synchronous response) has been formed.
+     bool mUtilizedPipeline;
+ 
+     // used when calling ReadSegments/WriteSegments on a transaction.
+     nsAHttpSegmentReader *mReader;
+ 
++#if defined(ENABLE_SCTP)
++    // transaction to pass to Connection's OnReadSegment
++    nsAHttpTransaction *mCurrentReadTransaction;
++    nsresult OnReadSegment(const char *, uint32_t, uint32_t *, nsAHttpTransaction *);  
++    bool IsSctpSocket() override;
++    virtual nsresult WriteSegments(nsAHttpSegmentWriter *, uint32_t, uint32_t *, nsAHttpTransaction *trans) override;
++#endif
+     // send buffer
+     nsCOMPtr<nsIInputStream>  mSendBufIn;
+     nsCOMPtr<nsIOutputStream> mSendBufOut;
+ 
+     // the push back buffer.  not exceeding nsIOService::gDefaultSegmentSize bytes.
+     char     *mPushBackBuf;
+     uint32_t  mPushBackLen;
+     uint32_t  mPushBackMax;
+diff --git a/netwerk/protocol/http/nsHttpTransaction.cpp b/netwerk/protocol/http/nsHttpTransaction.cpp
+--- a/netwerk/protocol/http/nsHttpTransaction.cpp
++++ b/netwerk/protocol/http/nsHttpTransaction.cpp
+@@ -86,16 +86,19 @@ LogHeaders(const char *lineStart)
+ 
+ //-----------------------------------------------------------------------------
+ // nsHttpTransaction <public>
+ //-----------------------------------------------------------------------------
+ 
+ nsHttpTransaction::nsHttpTransaction()
+     : mLock("transaction lock")
+     , mRequestSize(0)
++#if defined(ENABLE_SCTP)
++    , mSctpInputStreamIdChanged(false)
++#endif
+     , mConnection(nullptr)
+     , mRequestHead(nullptr)
+     , mResponseHead(nullptr)
+     , mContentLength(-1)
+     , mContentRead(0)
+     , mInvalidResponseBytesRead(0)
+     , mPushedStream(nullptr)
+     , mInitialRwin(0)
+@@ -153,19 +156,21 @@ nsHttpTransaction::nsHttpTransaction()
+ #endif
+     mSelfAddr.raw.family = PR_AF_UNSPEC;
+     mPeerAddr.raw.family = PR_AF_UNSPEC;
+ }
+ 
+ nsHttpTransaction::~nsHttpTransaction()
+ {
+     LOG(("Destroying nsHttpTransaction @%p\n", this));
+-
++printf("Destroying nsHttpTransaction @%p\n", this);
+     if (mPushedStream) {
++    printf("vor OnPushFailed\n");
+         mPushedStream->OnPushFailed();
++    printf("nach OnPushFailed\n");
+         mPushedStream = nullptr;
+     }
+ 
+     if (mTokenBucketCancel) {
+         mTokenBucketCancel->Cancel(NS_ERROR_ABORT);
+         mTokenBucketCancel = nullptr;
+     }
+ 
+@@ -662,17 +667,23 @@ NS_METHOD
+ nsHttpTransaction::ReadRequestSegment(nsIInputStream *stream,
+                                       void *closure,
+                                       const char *buf,
+                                       uint32_t offset,
+                                       uint32_t count,
+                                       uint32_t *countRead)
+ {
+     nsHttpTransaction *trans = (nsHttpTransaction *) closure;
++// No need to check for SCTP socket here.  TCP sockets can use trans version.
++printf("nsHttpTransaction::ReadRequestSegment\n");
++#if defined(ENABLE_SCTP)
++    nsresult rv = trans->mReader->OnReadSegment(buf, count, countRead, trans);
++#else
+     nsresult rv = trans->mReader->OnReadSegment(buf, count, countRead);
++#endif   
+     if (NS_FAILED(rv)) return rv;
+ 
+     if (trans->TimingEnabled()) {
+         // Set the timestamp to Now(), only if it null
+         trans->SetRequestStart(TimeStamp::Now(), true);
+     }
+ 
+     trans->CountSentBytes(*countRead);
+@@ -680,36 +691,39 @@ nsHttpTransaction::ReadRequestSegment(ns
+     return NS_OK;
+ }
+ 
+ nsresult
+ nsHttpTransaction::ReadSegments(nsAHttpSegmentReader *reader,
+                                 uint32_t count, uint32_t *countRead)
+ {
+     MOZ_ASSERT(PR_GetCurrentThread() == gSocketThread);
+-
++printf("nsHttpTransaction::ReadSegments\n");
+     if (mTransactionDone) {
++    printf("transaction is done\n");
+         *countRead = 0;
+         return mStatus;
+     }
+-
++printf("!mTransactionDone\n");
+     if (!mConnected) {
+         mConnected = true;
+         mConnection->GetSecurityInfo(getter_AddRefs(mSecurityInfo));
+     }
+ 
+     mDeferredSendProgress = false;
+     mReader = reader;
++printf("go to mRequestStream->ReadSegments\n");
+     nsresult rv = mRequestStream->ReadSegments(ReadRequestSegment, this, count, countRead);
+     mReader = nullptr;
+-
++printf("returned from mRequestStream->ReadSegments with countRead=%d\n", *countRead);
+     if (mDeferredSendProgress && mConnection && mConnection->Transport()) {
+         // to avoid using mRequestStream concurrently, OnTransportStatus()
+         // did not report upload status off the ReadSegments() stack from nsSocketTransport
+         // do it now.
++        printf("vor OnTransportStatus\n");
+         OnTransportStatus(mConnection->Transport(), NS_NET_STATUS_SENDING_TO, 0);
+     }
+     mDeferredSendProgress = false;
+ 
+     if (mForceRestart) {
+         // The forceRestart condition was dealt with on the stack, but it did not
+         // clear the flag because nsPipe in the readsegment stack clears out
+         // return codes, so we need to use the flag here as a cue to return ERETARGETED
+@@ -717,16 +731,17 @@ nsHttpTransaction::ReadSegments(nsAHttpS
+             rv = NS_BINDING_RETARGETED;
+         }
+         mForceRestart = false;
+     }
+ 
+     // if read would block then we need to AsyncWait on the request stream.
+     // have callback occur on socket thread so we stay synchronized.
+     if (rv == NS_BASE_STREAM_WOULD_BLOCK) {
++    printf("NS_BASE_STREAM_WOULD_BLOCK\n");
+         nsCOMPtr<nsIAsyncInputStream> asyncIn =
+                 do_QueryInterface(mRequestStream);
+         if (asyncIn) {
+             nsCOMPtr<nsIEventTarget> target;
+             gHttpHandler->GetSocketThreadTarget(getter_AddRefs(target));
+             if (target)
+                 asyncIn->AsyncWait(this, 0, 0, target);
+             else {
+@@ -743,89 +758,126 @@ NS_METHOD
+ nsHttpTransaction::WritePipeSegment(nsIOutputStream *stream,
+                                     void *closure,
+                                     char *buf,
+                                     uint32_t offset,
+                                     uint32_t count,
+                                     uint32_t *countWritten)
+ {
+     nsHttpTransaction *trans = (nsHttpTransaction *) closure;
++printf("nsHttpTransaction::WritePipeSegment\n");
++    if (trans->mTransactionDone) {
++    printf("transaction %p is done\n", trans);
++        return NS_BASE_STREAM_CLOSED; // stop iterating
++    }
+ 
+-    if (trans->mTransactionDone)
+-        return NS_BASE_STREAM_CLOSED; // stop iterating
++#if defined(ENABLE_SCTP)
++    if(trans->mSctpInputStreamIdChanged)
++        return NS_SCTP_WRONG_TRANSACTION;
++#endif
+ 
+     if (trans->TimingEnabled()) {
+         // Set the timestamp to Now(), only if it null
+         trans->SetResponseStart(TimeStamp::Now(), true);
+     }
+ 
+     // Bug 1153929 - add checks to fix windows crash
+     MOZ_ASSERT(trans->mWriter);
+     if (!trans->mWriter) {
+         return NS_ERROR_UNEXPECTED;
+     }
+ 
+     nsresult rv;
+     //
+     // OK, now let the caller fill this segment with data.
+     //
++    printf("nsHttpTransaction: call trans->mWriter->OnWriteSegment\n");
+     rv = trans->mWriter->OnWriteSegment(buf, count, countWritten);
+-    if (NS_FAILED(rv)) return rv; // caller didn't want to write anything
++    printf("nsHttpTransaction: on WriteSegment returned with countWritten=%d\n", *countWritten);
++
++    if (NS_FAILED(rv) && rv != NS_SCTP_INPUT_STREAM_ID_CHANGED) {
++        printf("NS_FAILED(rv): return\n");
++        return rv; // caller didn't want to write anything
++    }
++ 	
++#if defined(ENABLE_SCTP)
++    if (NS_FAILED(rv) && rv != NS_SCTP_INPUT_STREAM_ID_CHANGED) {
++        printf("NS_FAILED(rv): return\n");
++        return rv; // caller didn't want to write anything
++    }
++    if (rv == NS_SCTP_INPUT_STREAM_ID_CHANGED)
++        trans->mSctpInputStreamIdChanged = true;
++#else
++    if (NS_FAILED(rv)) {
++        printf("NS_FAILED(rv): return\n");
++        return rv; // caller didn't want to write anything
++    }
++#endif
+ 
+     MOZ_ASSERT(*countWritten > 0, "bad writer");
+     trans->CountRecvBytes(*countWritten);
+     trans->mReceivedData = true;
+ 
+     // Let the transaction "play" with the buffer.  It is free to modify
+     // the contents of the buffer and/or modify countWritten.
+     // - Bytes in HTTP headers don't count towards countWritten, so the input
+     // side of pipe (aka nsHttpChannel's mTransactionPump) won't hit
+     // OnInputStreamReady until all headers have been parsed.
+     //
++    printf("go and process Data: count=%d\n", *countWritten);
+     rv = trans->ProcessData(buf, *countWritten, countWritten);
++    printf("returned from ProcessData with countWritten=%d\n", *countWritten);
+     if (NS_FAILED(rv))
+         trans->Close(rv);
+ 
+     return rv; // failure code only stops WriteSegments; it is not propagated.
+ }
+ 
+ nsresult
+ nsHttpTransaction::WriteSegments(nsAHttpSegmentWriter *writer,
+                                  uint32_t count, uint32_t *countWritten)
+ {
+     static bool reentrantFlag = false;
+     LOG(("nsHttpTransaction::WriteSegments %p reentrantFlag=%d",
+          this, reentrantFlag));
++    printf("nsHttpTransaction::WriteSegments %p reentrantFlag=%d",
++         this, reentrantFlag);
+     MOZ_DIAGNOSTIC_ASSERT(!reentrantFlag);
+     reentrantFlag = true;
+     MOZ_ASSERT(PR_GetCurrentThread() == gSocketThread);
+ 
+     if (mTransactionDone) {
++    printf("mTransactionDone\n");
+         reentrantFlag = false;
+         return NS_SUCCEEDED(mStatus) ? NS_BASE_STREAM_CLOSED : mStatus;
+     }
+ 
++#if defined(ENABLE_SCTP)
++    mSctpInputStreamIdChanged = false;
++#endif
++
+     mWriter = writer;
+ 
+ #ifdef WIN32 // bug 1153929
+     MOZ_DIAGNOSTIC_ASSERT(mPipeOut);
+     uint32_t * vtable = (uint32_t *) mPipeOut.get();
+     MOZ_DIAGNOSTIC_ASSERT(*vtable != 0);
+ #endif // WIN32
+ 
+     if (!mPipeOut) {
+         reentrantFlag = false;
+         return NS_ERROR_UNEXPECTED;
+     }
+-
++printf("vor mPipeOut->WriteSegments\n");
+     nsresult rv = mPipeOut->WriteSegments(WritePipeSegment, this, count, countWritten);
+-
++printf("nach mPipeOut->WriteSegments\n");
+     mWriter = nullptr;
+ 
+     if (mForceRestart) {
++    printf("mForceRestart\n");
+         // The forceRestart condition was dealt with on the stack, but it did not
+         // clear the flag because nsPipe in the writesegment stack clears out
+         // return codes, so we need to use the flag here as a cue to return ERETARGETED
+         if (NS_SUCCEEDED(rv)) {
+             rv = NS_BINDING_RETARGETED;
+         }
+         mForceRestart = false;
+     }
+@@ -842,16 +894,29 @@ nsHttpTransaction::WriteSegments(nsAHttp
+             rv = NS_ERROR_UNEXPECTED;
+         }
+     }
+ 
+     reentrantFlag = false;
+     return rv;
+ }
+ 
++#if defined(ENABLE_SCTP)
++nsresult
++nsHttpTransaction::WriteSegments(nsAHttpSegmentWriter *writer,
++                                 uint32_t count,
++                                 uint32_t *countWritten,
++                                 nsAHttpTransaction *trans)
++{
++printf("WriteSegments for SCTP not implemented yet\n");
++ //   return NS_ERROR_NOT_IMPLEMENTED;
++    return WriteSegments(writer, count, countWritten);
++}
++#endif
++
+ nsresult
+ nsHttpTransaction::SaveNetworkStats(bool enforce)
+ {
+ #ifdef MOZ_WIDGET_GONK
+     // Check if active network and appid are valid.
+     if (!mActiveNetworkInfo || mAppId == NECKO_NO_APP_ID) {
+         return NS_OK;
+     }
+@@ -885,17 +950,17 @@ nsHttpTransaction::SaveNetworkStats(bool
+     return NS_ERROR_NOT_IMPLEMENTED;
+ #endif
+ }
+ 
+ void
+ nsHttpTransaction::Close(nsresult reason)
+ {
+     LOG(("nsHttpTransaction::Close [this=%p reason=%x]\n", this, reason));
+-
++printf("nsHttpTransaction::Close [this=%p reason=%x]\n", this, reason);
+     MOZ_ASSERT(PR_GetCurrentThread() == gSocketThread);
+     if (reason == NS_BINDING_RETARGETED) {
+         LOG(("  close %p skipped due to ERETARGETED\n", this));
+         return;
+     }
+ 
+     if (mClosed) {
+         LOG(("  already closed\n"));
+@@ -1062,22 +1127,24 @@ nsHttpTransaction::Close(nsresult reason
+                 reason = NS_ERROR_NET_RESET;
+             }
+         }
+ 
+         // honor the sticky connection flag...
+         if (mCaps & NS_HTTP_STICKY_CONNECTION)
+             relConn = false;
+     }
+-
++printf("vor TimingEnabled\n");
+     // mTimings.responseEnd is normally recorded based on the end of a
+     // HTTP delimiter such as chunked-encodings or content-length. However,
+     // EOF or an error still require an end time be recorded.
+     if (TimingEnabled()) {
++    printf("call Timings()\n");
+         const TimingStruct timings = Timings();
++        printf("returned ...\n");
+         if (timings.responseEnd.IsNull() && !timings.responseStart.IsNull()) {
+             SetResponseEnd(TimeStamp::Now());
+         }
+     }
+ 
+     if (relConn && mConnection) {
+         MutexAutoLock lock(mLock);
+         mConnection = nullptr;
+@@ -1667,17 +1734,17 @@ nsresult
+ nsHttpTransaction::HandleContent(char *buf,
+                                  uint32_t count,
+                                  uint32_t *contentRead,
+                                  uint32_t *contentRemaining)
+ {
+     nsresult rv;
+ 
+     LOG(("nsHttpTransaction::HandleContent [this=%p count=%u]\n", this, count));
+-
++printf("nsHttpTransaction::HandleContent [this=%p count=%u]\n", this, count);
+     *contentRead = 0;
+     *contentRemaining = 0;
+ 
+     MOZ_ASSERT(mConnection);
+ 
+     if (!mDidContentStart) {
+         rv = HandleContentStart();
+         if (NS_FAILED(rv)) return rv;
+@@ -1736,26 +1803,27 @@ nsHttpTransaction::HandleContent(char *b
+ 
+     if (*contentRead) {
+         // update count of content bytes read and report progress...
+         mContentRead += *contentRead;
+     }
+ 
+     LOG(("nsHttpTransaction::HandleContent [this=%p count=%u read=%u mContentRead=%lld mContentLength=%lld]\n",
+         this, count, *contentRead, mContentRead, mContentLength));
+-
++printf("nsHttpTransaction::HandleContent [this=%p count=%u read=%u mContentRead=%ld mContentLength=%ld]\n",
++        this, count, *contentRead, mContentRead, mContentLength);
+     // Check the size of chunked responses. If we exceed the max pipeline size
+     // for this response reschedule the pipeline
+     if ((mClassification != CLASS_SOLO) &&
+         mChunkedDecoder &&
+         ((mContentRead + mChunkedDecoder->GetChunkRemaining()) >
+          mMaxPipelineObjectSize)) {
+         CancelPipeline(nsHttpConnectionMgr::BadUnexpectedLarge);
+     }
+-
++printf("mContentRead=%ld mContentLength=%ld\n", mContentRead, mContentLength);
+     // check for end-of-file
+     if ((mContentRead == mContentLength) ||
+         (mChunkedDecoder && mChunkedDecoder->ReachedEOF())) {
+         // the transaction is done with a complete response.
+         mTransactionDone = true;
+         mResponseIsComplete = true;
+         ReleaseBlockingTransaction();
+ 
+@@ -1778,23 +1846,23 @@ nsHttpTransaction::HandleContent(char *b
+ }
+ 
+ nsresult
+ nsHttpTransaction::ProcessData(char *buf, uint32_t count, uint32_t *countRead)
+ {
+     nsresult rv;
+ 
+     LOG(("nsHttpTransaction::ProcessData [this=%p count=%u]\n", this, count));
+-
++printf("nsHttpTransaction::ProcessData [this=%p count=%u]\n", this, count);
+     *countRead = 0;
+ 
+     // we may not have read all of the headers yet...
+     if (!mHaveAllHeaders) {
+         uint32_t bytesConsumed = 0;
+-
++printf("not read all headers\n");
+         do {
+             uint32_t localBytesConsumed = 0;
+             char *localBuf = buf + bytesConsumed;
+             uint32_t localCount = count - bytesConsumed;
+ 
+             rv = ParseHead(localBuf, localCount, &localBytesConsumed);
+             if (NS_FAILED(rv) && rv != NS_ERROR_NET_INTERRUPT)
+                 return rv;
+@@ -1816,16 +1884,17 @@ nsHttpTransaction::ProcessData(char *buf
+             completeResponseHeaders.AppendLiteral("\r\n");
+             mActivityDistributor->ObserveActivity(
+                 mChannel,
+                 NS_HTTP_ACTIVITY_TYPE_HTTP_TRANSACTION,
+                 NS_HTTP_ACTIVITY_SUBTYPE_RESPONSE_HEADER,
+                 PR_Now(), 0,
+                 completeResponseHeaders);
+         }
++        printf("count reduced to %d\n", count);
+     }
+ 
+     // even though count may be 0, we still want to call HandleContent
+     // so it can complete the transaction if this is a "no-content" response.
+     if (mHaveAllHeaders) {
+         uint32_t countRemaining = 0;
+         //
+         // buf layout:
+@@ -1836,16 +1905,17 @@ nsHttpTransaction::ProcessData(char *buf
+         //
+         // count          : bytes read from the socket
+         // countRead      : bytes corresponding to this transaction
+         // countRemaining : bytes corresponding to next pipelined transaction
+         //
+         // NOTE:
+         // count > countRead + countRemaining <==> chunked transfer encoding
+         //
++        printf("go HandleContent: count=%d, countRead=%d, countRemaining=%d\n", count, *countRead, countRemaining);
+         rv = HandleContent(buf, count, countRead, &countRemaining);
+         if (NS_FAILED(rv)) return rv;
+         // we may have read more than our share, in which case we must give
+         // the excess bytes back to the connection
+         if (mResponseIsComplete && countRemaining) {
+             MOZ_ASSERT(mConnection);
+             mConnection->PushBack(buf + *countRead, countRemaining);
+         }
+diff --git a/netwerk/protocol/http/nsHttpTransaction.h b/netwerk/protocol/http/nsHttpTransaction.h
+--- a/netwerk/protocol/http/nsHttpTransaction.h
++++ b/netwerk/protocol/http/nsHttpTransaction.h
+@@ -221,16 +221,24 @@ private:
+     nsCOMPtr<nsISupports>           mSecurityInfo;
+     nsCOMPtr<nsIAsyncInputStream>   mPipeIn;
+     nsCOMPtr<nsIAsyncOutputStream>  mPipeOut;
+     nsCOMPtr<nsISchedulingContext>  mSchedulingContext;
+ 
+     nsCOMPtr<nsISupports>             mChannel;
+     nsCOMPtr<nsIHttpActivityObserver> mActivityDistributor;
+ 
++#if defined(ENABLE_SCTP)
++    // Used in nsHttpTransaction::WritePipeSegment to break loop in
++    // nsPipeOutputStream::WriteSegments
++    bool   mSctpInputStreamIdChanged;
++    virtual nsresult WriteSegments(nsAHttpSegmentWriter *, uint32_t, uint32_t *, nsAHttpTransaction *trans) override;
++  //  nsresult WriteSegments(nsAHttpSegmentWriter *, uint32_t, uint32_t *, nsAHttpTransaction *) override;	
++#endif
++
+     nsCString                       mReqHeaderBuf;    // flattened request headers
+     nsCOMPtr<nsIInputStream>        mRequestStream;
+     int64_t                         mRequestSize;
+ 
+     RefPtr<nsAHttpConnection>     mConnection;
+     RefPtr<nsHttpConnectionInfo>  mConnInfo;
+     nsHttpRequestHead              *mRequestHead;     // weak ref
+     nsHttpResponseHead             *mResponseHead;    // owning pointer
+

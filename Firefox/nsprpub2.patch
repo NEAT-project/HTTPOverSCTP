@@ -1,0 +1,825 @@
+diff --git a/nsprpub/pr/src/nspr.def b/nsprpub/pr/src/nspr.def
+--- a/nsprpub/pr/src/nspr.def
++++ b/nsprpub/pr/src/nspr.def
+@@ -436,16 +436,20 @@ EXPORTS ;-
+ ;+NSPR_4.7 {
+ ;+	global:
+ 		PR_ParseTimeStringToExplodedTime;
+ ;+} NSPR_4.6;
+ ;+NSPR_4.8 {
+ ;+	global:
+ 		PR_AssertCurrentThreadOwnsLock;
+ 		PR_AssertCurrentThreadInMonitor;
++		PR_OpenSCTPSocket;
++		PR_OpenSCTPOneToOneSocket;
++		PR_SctpRecvmsg;
++		PR_SctpSendmsg;
+ ;+} NSPR_4.7;
+ ;+NSPR_4.8.9 {
+ ;+      global:
+                 PR_GetVersion;
+ ;+} NSPR_4.8;
+ ;+NSPR_4.9.2 {
+ ;+      global:
+ 		PR_GetThreadName;
+diff --git a/nsprpub/pr/src/pthreads/ptio.c b/nsprpub/pr/src/pthreads/ptio.c
+--- a/nsprpub/pr/src/pthreads/ptio.c
++++ b/nsprpub/pr/src/pthreads/ptio.c
+@@ -307,18 +307,39 @@ struct pt_Continuation
+          */
+ 		struct file_spec {		
+         	off_t offset;                       /* offset in file to send */
+         	size_t nbytes;                      /* length of file data to send */
+         	size_t st_size;                     /* file size */
+ 		} file_spec;
+ #endif
+     } arg3;
+-    union { PRIntn flags; } arg4;           /* #4 - read/write flags */
+-    union { PRNetAddr *addr; } arg5;        /* #5 - send/recv address */
++    union { PRIntn flags; 
++#if defined(ENABLE_SCTP)
++            PRNetAddr *addr;                /*    - send/recv addr for SCTP */
++#endif    
++    } arg4;                                 /* #4 - read/write flags */
++    union { PRNetAddr *addr;
++#if defined(ENABLE_SCTP)
++            PRUint32 addr_len;              /*    - send/recv addr len for SCTP */
++#endif    
++    } arg5;                                 /* #5 - send/recv address */
++    
++#if defined(ENABLE_SCTP)
++    union { PRSctp_SndRcvInfo *sinfo;       /* #6 - SCTP sndrcvinfo structure */
++            PRSctp_ExtRcvInfo *serinfo;
++            PRUint32 ppid;                  /*    - SCTP ppid for sctp_sendmsg */
++    } arg6;
++    union { PRUint32 flags;                 /* #7 - SCTP sctp_sendmsg flags */
++            PRInt32 *msg_flags;             /*    - SCTP sctp_recvmsg msg_flags */
++    } arg7;
++    union { PRInt16 stream; } arg8;         /* #8 - SCTP stream number for sctp_sendmsg */
++    union { PRUint32 timetolive; } arg9;    /* #9 - SCTP timetolive for sctp_sendmsg */
++    union { PRUint32 context; } arg10;      /* #10 - SCTP context for sctp_sendmsg */
++#endif
+ 
+ #ifdef HPUX11
+     /*
+      * For sendfile()
+      */
+     int filedesc;                           /* descriptor of file to send */
+     int nbytes_to_send;                     /* size of header and file */
+ #endif  /* HPUX11 */
+@@ -770,16 +791,37 @@ static PRBool pt_recv_cont(pt_Continuati
+         op->arg1.osfd, op->arg2.buffer, op->arg3.amount, op->arg4.flags);
+ #endif
+     op->syserrno = errno;
+     return ((-1 == op->result.code) && 
+             (EWOULDBLOCK == op->syserrno || EAGAIN == op->syserrno)) ?
+         PR_FALSE : PR_TRUE;
+ }  /* pt_recv_cont */
+ 
++#if defined(ENABLE_SCTP)
++static PRBool pt_sctp_recvmsg_cont(pt_Continuation *op, PRInt16 revents)
++{
++   /*
++    * As with pt_recv_cont, any number of bytes will complete the operation.
++    */
++    op->result.code = _PR_MD_SCTP_RECVMSG(op->arg1.osfd,
++                                          op->arg2.buffer,
++                                          op->arg3.amount,
++                                          op->arg4.addr,
++                                        &(op->arg5.addr_len),
++                                          op->arg6.sinfo,
++                                          op->arg7.msg_flags);
++    op->syserrno = errno;
++
++    return ((-1 == op->result.code) &&
++            (EWOULDBLOCK == op->syserrno || EAGAIN == op->syserrno)) ?
++        PR_FALSE : PR_TRUE;
++}  /* pt_sctp_recvmsg_cont */
++#endif
++
+ static PRBool pt_send_cont(pt_Continuation *op, PRInt16 revents)
+ {
+     PRIntn bytes;
+ #if defined(SOLARIS)
+     PRInt32 tmp_amount = op->arg3.amount;
+ #endif
+     /*
+      * We want to write the entire amount out, no matter how many
+@@ -824,16 +866,55 @@ retry:
+     else if ((EWOULDBLOCK != op->syserrno) && (EAGAIN != op->syserrno))
+     {
+         op->result.code = -1;
+         return PR_TRUE;
+     }
+     else return PR_FALSE;
+ }  /* pt_send_cont */
+ 
++#if defined(ENABLE_SCTP)
++static PRBool pt_sctp_sendmsg_cont(pt_Continuation *op, PRInt16 revents)
++{
++    PRIntn bytes;
++
++    bytes = sctp_sendmsg(        op->arg1.osfd,
++                                 op->arg2.buffer,
++                                 op->arg3.amount,
++        (const struct sockaddr*) op->arg4.addr,
++                     (socklen_t) op->arg5.addr_len,
++                                 op->arg6.ppid,
++                                 op->arg7.flags,
++                                 op->arg8.stream,
++                                 op->arg9.timetolive,
++                                 op->arg10.context);
++    op->syserrno = errno;
++
++   /*
++    * sctp_sendmsg() should be atomic and therefore byte counting should
++    * be unnecessary.  However, I don't know that sctp_sendmsg() _is_ in
++    * fact atomic on all supported platforms, so I'm leaving this in
++    * for now.
++    */
++    if (bytes >= 0) {              /* this is progress */
++        char *bp = (char*)op->arg2.buffer;
++        bp += bytes;               /* adjust the buffer pointer */
++        op->arg2.buffer = bp;
++        op->result.code += bytes;  /* accumulate the number sent */
++        op->arg3.amount -= bytes;  /* and reduce the required count */
++        return (0 == op->arg3.amount) ? PR_TRUE : PR_FALSE;
++    }
++    else if ((EWOULDBLOCK != op->syserrno) && (EAGAIN != op->syserrno)) {
++        op->result.code = -1;
++        return PR_TRUE;
++    }
++    else return PR_FALSE;
++}  /* pt_sctp_sendmsg_cont */
++#endif
++
+ static PRBool pt_write_cont(pt_Continuation *op, PRInt16 revents)
+ {
+     PRIntn bytes;
+     /*
+      * We want to write the entire amount out, no matter how many
+      * tries it takes. Keep advancing the buffer and the decrementing
+      * the amount until the amount goes away. Return the total bytes
+      * (which should be the original amount) when finished (or an
+@@ -1699,17 +1780,25 @@ static PRFileDesc* pt_Accept(
+     {
+         addr->raw.family = ((struct sockaddr*)addr)->sa_family;
+     }
+ #endif /* _PR_HAVE_SOCKADDR_LEN */
+ #ifdef _PR_INET6
+ 	if (addr && (AF_INET6 == addr->raw.family))
+         addr->raw.family = PR_AF_INET6;
+ #endif
++#if defined(ENABLE_SCTP)
++    /*
++     * With SCTP enabled we cannot assume TCP, so we must get the file
++     * descriptor type.
++     */
++    newfd = pt_SetMethods(osfd, PR_GetDescType(fd), PR_TRUE, PR_FALSE);
++#else
+     newfd = pt_SetMethods(osfd, PR_DESC_SOCKET_TCP, PR_TRUE, PR_FALSE);
++#endif
+     if (newfd == NULL) close(osfd);  /* $$$ whoops! this doesn't work $$$ */
+     else
+     {
+         PR_ASSERT(IsValidNetAddr(addr) == PR_TRUE);
+         PR_ASSERT(IsValidNetAddrLen(addr, addr_len) == PR_TRUE);
+ #ifdef LINUX
+         /*
+          * On Linux, experiments showed that the accepted sockets
+@@ -1866,16 +1955,81 @@ static PRInt32 pt_Recv(
+             syserrno = op.syserrno;
+         }
+     }
+     if (bytes < 0)
+         pt_MapError(_PR_MD_MAP_RECV_ERROR, syserrno);
+     return bytes;
+ }  /* pt_Recv */
+ 
++#if defined(ENABLE_SCTP)
++static PRInt32 pt_Sctp_Recvmsg(
++    PRFileDesc          *fd,
++    void                *buf,
++    PRInt32              amount,
++    PRNetAddr           *from,
++    PRUint32            *fromlen,
++    PRSctp_SndRcvInfo   *sinfo,
++    PRInt32             *msg_flags,
++    PRIntervalTime timeout)
++{
++    PRInt32 syserrno, bytes = -1; 	
++    PRInt32 osflags;
++
++    /* convert to OS flags */
++    if (PR_MSG_PEEK == *msg_flags)
++        *msg_flags = MSG_PEEK;
++    else if (0 != *msg_flags) {
++        PR_SetError(PR_INVALID_ARGUMENT_ERROR, 0);
++        return bytes;
++    }
++
++    if (pt_TestAbort()) return bytes;
++
++    bytes = _PR_MD_SCTP_RECVMSG(fd->secret->md.osfd,
++                                buf,
++                                amount,
++                                from,
++                                fromlen,
++                                sinfo,
++                                msg_flags);
++    syserrno = errno;
++    if ((bytes == -1) && (syserrno == EWOULDBLOCK || syserrno == EAGAIN)
++        && (!fd->secret->nonblocking))
++    {
++        if (PR_INTERVAL_NO_WAIT == timeout) {
++            syserrno = ETIMEDOUT;
++        }
++        else
++        {
++            pt_Continuation op;
++            op.arg1.osfd = fd->secret->md.osfd;
++            op.arg2.buffer = buf;
++            op.arg3.amount = amount;
++            op.arg4.addr = from;
++            if(from)
++                op.arg5.addr_len = *fromlen;
++            else
++                op.arg5.addr_len = 0;
++            op.arg6.sinfo = sinfo;
++            op.arg7.msg_flags = msg_flags;
++            op.timeout = timeout;
++            op.function = pt_sctp_recvmsg_cont;
++            op.event = POLLIN | POLLPRI;
++            bytes = pt_Continue(&op);
++            syserrno = op.syserrno;
++        }
++    }	
++    if (bytes < 0)
++        pt_MapError(_PR_MD_MAP_RECV_ERROR, syserrno);
++    return bytes;
++}  /* pt_Sctp_Recvmsg */
++#endif
++
++
+ static PRInt32 pt_SocketRead(PRFileDesc *fd, void *buf, PRInt32 amount)
+ {
+     return pt_Recv(fd, buf, amount, 0, PR_INTERVAL_NO_TIMEOUT);
+ }  /* pt_SocketRead */
+ 
+ static PRInt32 pt_Send(
+     PRFileDesc *fd, const void *buf, PRInt32 amount,
+     PRIntn flags, PRIntervalTime timeout)
+@@ -1969,16 +2123,103 @@ retry:
+         bytes = pt_Continue(&op);
+         syserrno = op.syserrno;
+     }
+     if (bytes == -1)
+         pt_MapError(_PR_MD_MAP_SEND_ERROR, syserrno);
+     return bytes;
+ }  /* pt_Send */
+ 
++#if defined(ENABLE_SCTP)
++static PRInt32 pt_Sctp_Sendmsg(
++    PRFileDesc       *fd,
++    const void       *msg,
++    PRInt32           msgsz,
++    const PRNetAddr  *to,
++    PRUint32          tolen,
++    PRInt32           ppid,
++    PRUint32          flags,
++    PRInt16           stream,
++    PRInt32           timetolive,
++    PRInt32           context,
++    PRIntervalTime    timeout)
++{
++    PRInt32 syserrno, bytes = -1;
++    PRBool fNeedContinue = PR_FALSE;
++
++    if (pt_TestAbort()) return bytes;
++
++    bytes = sctp_sendmsg(        fd->secret->md.osfd,
++                                 msg,
++                                 msgsz,
++       (const struct sockaddr *) to,
++                     (socklen_t) tolen,
++                                 ppid,
++                                 flags,
++                                 stream,
++                                 timetolive,
++                                 context
++                         );
++    syserrno = errno;
++
++    if ( (bytes >= 0) && (bytes < msgsz) && (!fd->secret->nonblocking) )
++    {
++        if (PR_INTERVAL_NO_WAIT == timeout)
++        {
++            bytes = -1;
++            syserrno = ETIMEDOUT;
++        }
++        else
++        {
++            msg = (char *) msg + bytes;
++            msgsz -= bytes;
++            fNeedContinue = PR_TRUE;
++        }
++    }
++    if ( (bytes == -1) && (syserrno == EWOULDBLOCK || syserrno == EAGAIN)
++        && (!fd->secret->nonblocking) )
++    {
++        if (PR_INTERVAL_NO_WAIT == timeout) 
++            syserrno = ETIMEDOUT;
++        else
++        {
++            bytes = 0;
++            fNeedContinue = PR_TRUE;
++        }
++    }
++	
++    if (fNeedContinue == PR_TRUE)
++    {
++        pt_Continuation op;
++        op.arg1.osfd = fd->secret->md.osfd;
++        op.arg2.buffer = (void*)msg;
++        op.arg3.amount = msgsz;
++        op.arg4.addr = to;
++        op.arg5.addr_len = tolen;
++        op.arg6.ppid = ppid;
++        op.arg7.flags = flags;
++        op.arg8.stream = stream;
++        op.arg9.timetolive = timetolive;
++        op.arg10.context = context;
++        op.timeout = timeout;
++        op.result.code = bytes;  /* initialize the number sent */
++        op.function = pt_sctp_sendmsg_cont;
++        op.event = POLLOUT | POLLPRI;
++        bytes = pt_Continue(&op);
++        syserrno = op.syserrno;
++    }
++    if (bytes == -1) {
++        pt_MapError(_PR_MD_MAP_SEND_ERROR, syserrno);
++    }
++
++    return bytes;
++}  /* pt_Sctp_Sendmsg */
++#endif
++
++
+ static PRInt32 pt_SocketWrite(PRFileDesc *fd, const void *buf, PRInt32 amount)
+ {
+     return pt_Send(fd, buf, amount, 0, PR_INTERVAL_NO_TIMEOUT);
+ }  /* pt_SocketWrite */
+ 
+ static PRInt32 pt_SendTo(
+     PRFileDesc *fd, const void *buf,
+     PRInt32 amount, PRIntn flags, const PRNetAddr *addr,
+@@ -2850,16 +3091,20 @@ static PRStatus pt_GetSocketOption(PRFil
+                     PR_SecondsToInterval(linger.l_linger);
+                 break;
+             }
+             case PR_SockOpt_Reuseaddr:
+             case PR_SockOpt_Keepalive:
+             case PR_SockOpt_NoDelay:
+             case PR_SockOpt_Broadcast:
+             case PR_SockOpt_Reuseport:
++#if defined(ENABLE_SCTP)
++            case PR_SockOpt_UseExtRcvInfo:
++            case PR_SockOpt_SctpNoDelay:
++#endif
+             {
+                 PRIntn value;
+                 length = sizeof(PRIntn);
+                 rv = getsockopt(
+                     fd->secret->md.osfd, level, name, (char*)&value, &length);
+                 PR_ASSERT((-1 == rv) || (sizeof(PRIntn) == length));
+                 data->value.reuse_addr = (0 == value) ? PR_FALSE : PR_TRUE;
+                 break;
+@@ -2927,16 +3172,49 @@ static PRStatus pt_GetSocketOption(PRFil
+                 length = sizeof(data->value.mcast_if.inet.ip);
+                 rv = getsockopt(
+                     fd->secret->md.osfd, level, name,
+                     (char*)&data->value.mcast_if.inet.ip, &length);
+                 PR_ASSERT((-1 == rv)
+                     || (sizeof(data->value.mcast_if.inet.ip) == length));
+                 break;
+             }
++#if defined(ENABLE_SCTP)
++           /*
++            * Added support for the following SCTP socket options:
++            *     SCTP_DEFAULT_SEND_PARAM
++            *     SCTP_EVENTS
++            *     SCTP_INITMSG
++            *     SCTP_ASSOCINFO
++            *     SCTP_MAXSEG
++            *     SCTP_STATUS
++            *     SCTP_SET_PEER_PRIMARY_ADDR
++            *     SCTP_SET_PRIMARY_ADDR
++            */
++            case PR_SockOpt_DefaultSendParam:
++            case PR_SockOpt_Events:
++            case PR_SockOpt_InitMsg:
++            case PR_SockOpt_AssocInfo:
++            case PR_SockOpt_SctpMaxSegment:
++            case PR_SockOpt_Status:
++            {
++                rv = _PR_MD_SCTPGETSOCKETOPTION(fd, data);
++                break;
++            }
++            case PR_SockOpt_SetPeerPrimaryAddr:
++            {
++                PR_NOT_REACHED("SCTP_SET_PEER_PRIMARY_ADDR socket option is \"Set\" only");
++                break;
++            }
++            case PR_SockOpt_SetPrimaryAddr:
++            {
++                PR_NOT_REACHED("SCTP_SET_PRIMARY_ADDR socket option is \"Set\" only");
++                break;
++            }
++#endif
+             default:
+                 PR_NOT_REACHED("Unknown socket option");
+                 break;
+         }
+         if (-1 == rv) _PR_MD_MAP_GETSOCKOPT_ERROR(errno);
+     }
+     return (-1 == rv) ? PR_FAILURE : PR_SUCCESS;
+ }  /* pt_GetSocketOption */
+@@ -2970,16 +3248,20 @@ static PRStatus pt_SetSocketOption(PRFil
+                     fd->secret->md.osfd, level, name, (char*)&linger, sizeof(linger));
+                 break;
+             }
+             case PR_SockOpt_Reuseaddr:
+             case PR_SockOpt_Keepalive:
+             case PR_SockOpt_NoDelay:
+             case PR_SockOpt_Broadcast:
+             case PR_SockOpt_Reuseport:
++#if defined(ENABLE_SCTP)
++            case PR_SockOpt_UseExtRcvInfo:
++            case PR_SockOpt_SctpNoDelay:
++#endif
+             {
+                 PRIntn value = (data->value.reuse_addr) ? 1 : 0;
+                 rv = setsockopt(
+                     fd->secret->md.osfd, level, name,
+                     (char*)&value, sizeof(PRIntn));
+ #ifdef LINUX
+                 /* for pt_LinuxSendFile */
+                 if (name == TCP_NODELAY && rv == 0) {
+@@ -3038,16 +3320,45 @@ static PRStatus pt_SetSocketOption(PRFil
+             case PR_SockOpt_McastInterface:
+             {
+                 rv = setsockopt(
+                     fd->secret->md.osfd, level, name,
+                     (char*)&data->value.mcast_if.inet.ip,
+                     sizeof(data->value.mcast_if.inet.ip));
+                 break;
+             }
++#if defined(ENABLE_SCTP)
++           /*
++            * Added support for the following SCTP socket options:
++            *     SCTP_DEFAULT_SEND_PARAM
++            *     SCTP_EVENTS
++            *     SCTP_INITMSG
++            *     SCTP_ASSOCINFO
++            *     SCTP_MAXSEG
++            *     SCTP_STATUS
++            *     SCTP_SET_PEER_PRIMARY_ADDRESS
++            *     SCTP_SET_PRIMARY_ADDRESS
++            */
++            case PR_SockOpt_DefaultSendParam:
++            case PR_SockOpt_Events:
++            case PR_SockOpt_InitMsg:
++            case PR_SockOpt_AssocInfo:
++            case PR_SockOpt_SctpMaxSegment:
++            case PR_SockOpt_SetPeerPrimaryAddr:
++            case PR_SockOpt_SetPrimaryAddr:
++            {
++                rv = _PR_MD_SCTPSETSOCKETOPTION(fd, data);
++                break;
++            }
++            case PR_SockOpt_Status:
++            {
++                PR_NOT_REACHED("SCTP_STATUS socket option is \"Get\" only");
++                break;
++            }
++#endif
+             default:
+                 PR_NOT_REACHED("Unknown socket option");
+                 break;
+         }
+         if (-1 == rv) _PR_MD_MAP_SETSOCKOPT_ERROR(errno);
+     }
+     return (-1 == rv) ? PR_FAILURE : PR_SUCCESS;
+ }  /* pt_SetSocketOption */
+@@ -3077,19 +3388,24 @@ static PRIOMethods _pr_file_methods = {
+     (PRRecvFN)_PR_InvalidInt,        
+     (PRSendFN)_PR_InvalidInt,        
+     (PRRecvfromFN)_PR_InvalidInt,    
+     (PRSendtoFN)_PR_InvalidInt,        
+     pt_Poll,
+     (PRAcceptreadFN)_PR_InvalidInt,   
+     (PRTransmitfileFN)_PR_InvalidInt, 
+     (PRGetsocknameFN)_PR_InvalidStatus,    
+-    (PRGetpeernameFN)_PR_InvalidStatus,    
++    (PRGetpeernameFN)_PR_InvalidStatus,
++#if defined(ENABLE_SCTP)
++    (PRSctp_recvmsgFN)_PR_InvalidInt,    
++    (PRSctp_sendmsgFN)_PR_InvalidInt,
++#else  
+     (PRReservedFN)_PR_InvalidInt,    
+-    (PRReservedFN)_PR_InvalidInt,    
++    (PRReservedFN)_PR_InvalidInt,
++#endif   
+     (PRGetsocketoptionFN)_PR_InvalidStatus,
+     (PRSetsocketoptionFN)_PR_InvalidStatus,
+     (PRSendfileFN)_PR_InvalidInt, 
+     (PRConnectcontinueFN)_PR_InvalidStatus, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt
+@@ -3116,19 +3432,24 @@ static PRIOMethods _pr_pipe_methods = {
+     (PRRecvFN)_PR_InvalidInt,        
+     (PRSendFN)_PR_InvalidInt,        
+     (PRRecvfromFN)_PR_InvalidInt,    
+     (PRSendtoFN)_PR_InvalidInt,        
+     pt_Poll,
+     (PRAcceptreadFN)_PR_InvalidInt,   
+     (PRTransmitfileFN)_PR_InvalidInt, 
+     (PRGetsocknameFN)_PR_InvalidStatus,    
+-    (PRGetpeernameFN)_PR_InvalidStatus,    
++    (PRGetpeernameFN)_PR_InvalidStatus,
++#if defined(ENABLE_SCTP)
++    (PRSctp_recvmsgFN)_PR_InvalidInt,
++    (PRSctp_sendmsgFN)_PR_InvalidInt,
++#else    
+     (PRReservedFN)_PR_InvalidInt,    
+-    (PRReservedFN)_PR_InvalidInt,    
++    (PRReservedFN)_PR_InvalidInt,
++#endif    
+     (PRGetsocketoptionFN)_PR_InvalidStatus,
+     (PRSetsocketoptionFN)_PR_InvalidStatus,
+     (PRSendfileFN)_PR_InvalidInt, 
+     (PRConnectcontinueFN)_PR_InvalidStatus, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt
+@@ -3156,18 +3477,23 @@ static PRIOMethods _pr_tcp_methods = {
+     pt_Send,
+     (PRRecvfromFN)_PR_InvalidInt,
+     (PRSendtoFN)_PR_InvalidInt,
+     pt_Poll,
+     pt_AcceptRead,
+     pt_TransmitFile,
+     pt_GetSockName,
+     pt_GetPeerName,
++#if defined (ENABLE_SCTP)
++    (PRSctp_recvmsgFN)_PR_InvalidInt,
++    (PRSctp_sendmsgFN)_PR_InvalidInt,
++#else
+     (PRReservedFN)_PR_InvalidInt,
+     (PRReservedFN)_PR_InvalidInt,
++#endif
+     pt_GetSocketOption,
+     pt_SetSocketOption,
+     pt_SendFile, 
+     pt_ConnectContinue,
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt
+@@ -3195,28 +3521,74 @@ static PRIOMethods _pr_udp_methods = {
+     pt_Send,
+     pt_RecvFrom,
+     pt_SendTo,
+     pt_Poll,
+     (PRAcceptreadFN)_PR_InvalidInt,
+     (PRTransmitfileFN)_PR_InvalidInt,
+     pt_GetSockName,
+     pt_GetPeerName,
++#if defined (ENABLE_SCTP)
++    (PRSctp_recvmsgFN)_PR_InvalidInt,
++    (PRSctp_sendmsgFN)_PR_InvalidInt,
++#else
+     (PRReservedFN)_PR_InvalidInt,
+     (PRReservedFN)_PR_InvalidInt,
++#endif
+     pt_GetSocketOption,
+     pt_SetSocketOption,
+     (PRSendfileFN)_PR_InvalidInt, 
+     (PRConnectcontinueFN)_PR_InvalidStatus, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt
+ };
+ 
++#if defined(ENABLE_SCTP)
++static PRIOMethods _pr_sctp_methods_one_to_one = {
++    PR_DESC_SOCKET_SCTP_ONE_TO_ONE,
++    pt_Close,
++    pt_SocketRead,
++    pt_SocketWrite,
++    pt_Available_s,
++    pt_Available64_s,
++    pt_Synch,
++    (PRSeekFN)_PR_InvalidInt,
++    (PRSeek64FN)_PR_InvalidInt64,
++    (PRFileInfoFN)_PR_InvalidStatus,
++    (PRFileInfo64FN)_PR_InvalidStatus,
++    pt_Writev,
++    pt_Connect,
++    pt_Accept,
++    pt_Bind,
++    pt_Listen,
++    pt_Shutdown,
++    pt_Recv,
++    pt_Send,
++    (PRRecvfromFN)_PR_InvalidInt,
++    (PRSendtoFN)_PR_InvalidInt,
++    pt_Poll,
++    pt_AcceptRead,
++    pt_TransmitFile,
++    pt_GetSockName,
++    pt_GetPeerName,
++    pt_Sctp_Recvmsg,
++    pt_Sctp_Sendmsg,
++    pt_GetSocketOption,
++    pt_SetSocketOption,
++    pt_SendFile,
++    pt_ConnectContinue,
++    (PRReservedFN)_PR_InvalidInt,
++    (PRReservedFN)_PR_InvalidInt,
++    (PRReservedFN)_PR_InvalidInt,
++    (PRReservedFN)_PR_InvalidInt
++};
++#endif
++
+ static PRIOMethods _pr_socketpollfd_methods = {
+     (PRDescType) 0,
+     (PRCloseFN)_PR_InvalidStatus,
+     (PRReadFN)_PR_InvalidInt,
+     (PRWriteFN)_PR_InvalidInt,
+     (PRAvailableFN)_PR_InvalidInt,
+     (PRAvailable64FN)_PR_InvalidInt64,
+     (PRFsyncFN)_PR_InvalidStatus,
+@@ -3233,19 +3605,24 @@ static PRIOMethods _pr_socketpollfd_meth
+     (PRRecvFN)_PR_InvalidInt,        
+     (PRSendFN)_PR_InvalidInt,        
+     (PRRecvfromFN)_PR_InvalidInt,    
+     (PRSendtoFN)_PR_InvalidInt,        
+ 	pt_Poll,
+     (PRAcceptreadFN)_PR_InvalidInt,   
+     (PRTransmitfileFN)_PR_InvalidInt, 
+     (PRGetsocknameFN)_PR_InvalidStatus,    
+-    (PRGetpeernameFN)_PR_InvalidStatus,    
++    (PRGetpeernameFN)_PR_InvalidStatus,
++#if defined(ENABLE_SCTP)
++    (PRSctp_recvmsgFN)_PR_InvalidInt,
++    (PRSctp_sendmsgFN)_PR_InvalidInt,
++#else   
+     (PRReservedFN)_PR_InvalidInt,    
+-    (PRReservedFN)_PR_InvalidInt,    
++    (PRReservedFN)_PR_InvalidInt,
++#endif    
+     (PRGetsocketoptionFN)_PR_InvalidStatus,
+     (PRSetsocketoptionFN)_PR_InvalidStatus,
+     (PRSendfileFN)_PR_InvalidInt, 
+     (PRConnectcontinueFN)_PR_InvalidStatus, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt, 
+     (PRReservedFN)_PR_InvalidInt
+@@ -3334,16 +3711,26 @@ static PRFileDesc *pt_SetMethods(
+             case PR_DESC_SOCKET_UDP:
+                 fd->methods = PR_GetUDPMethods();
+                 pt_MakeFdNonblock(osfd);
+                 break;
+             case PR_DESC_PIPE:
+                 fd->methods = PR_GetPipeMethods();
+                 pt_MakeFdNonblock(osfd);
+                 break;
++#if defined(ENABLE_SCTP)
++            case PR_DESC_SOCKET_SCTP_ONE_TO_ONE:
++                fd->methods = PR_GetSCTPOneToOneMethods();
++#ifdef _PR_ACCEPT_INHERIT_NONBLOCK
++                if (!isAcceptedSocket) pt_MakeSocketNonblock(osfd);
++#else
++                pt_MakeSocketNonblock(osfd);
++#endif
++                break;
++#endif
+             default:
+                 break;
+         }
+     }
+     return fd;
+ }  /* pt_SetMethods */
+ 
+ PR_IMPLEMENT(const PRIOMethods*) PR_GetFileMethods(void)
+@@ -3361,16 +3748,23 @@ PR_IMPLEMENT(const PRIOMethods*) PR_GetT
+     return &_pr_tcp_methods;
+ }  /* PR_GetTCPMethods */
+ 
+ PR_IMPLEMENT(const PRIOMethods*) PR_GetUDPMethods(void)
+ {
+     return &_pr_udp_methods;
+ }  /* PR_GetUDPMethods */
+ 
++#if defined(ENABLE_SCTP)
++PR_IMPLEMENT(const PRIOMethods*) PR_GetSCTPOneToOneMethods(void)
++{
++    return &_pr_sctp_methods_one_to_one;
++}  /* PR_GetSCTPOneToOneMethods */
++#endif
++
+ static const PRIOMethods* PR_GetSocketPollFdMethods(void)
+ {
+     return &_pr_socketpollfd_methods;
+ }  /* PR_GetSocketPollFdMethods */
+ 
+ PR_IMPLEMENT(PRFileDesc*) PR_AllocFileDesc(
+     PRInt32 osfd, const PRIOMethods *methods)
+ {
+@@ -3380,16 +3774,19 @@ PR_IMPLEMENT(PRFileDesc*) PR_AllocFileDe
+ 
+     fd->methods = methods;
+     fd->secret->md.osfd = osfd;
+     /* Make fd non-blocking */
+     if (osfd > 2)
+     {
+         /* Don't mess around with stdin, stdout or stderr */
+         if (&_pr_tcp_methods == methods) pt_MakeSocketNonblock(osfd);
++#if defined(ENABLE_SCTP)
++        else if (&_pr_sctp_methods_one_to_one == methods) pt_MakeSocketNonblock(osfd);
++#endif
+         else pt_MakeFdNonblock(osfd);
+     }
+     fd->secret->state = _PR_FILEDESC_OPEN;
+     fd->secret->inheritable = _PR_TRI_UNKNOWN;
+     return fd;
+     
+ failed:
+     PR_SetError(PR_OUT_OF_MEMORY_ERROR, 0);
+@@ -3453,18 +3850,27 @@ PR_IMPLEMENT(PRFileDesc*) PR_Socket(PRIn
+         && PR_AF_INET6_SDP != domain
+ #endif /* SOLARIS */
+ #endif /* _PR_HAVE_SDP */
+         && PF_UNIX != domain)
+     {
+         PR_SetError(PR_ADDRESS_NOT_SUPPORTED_ERROR, 0);
+         return fd;
+     }
+-	if (type == SOCK_STREAM) ftype = PR_DESC_SOCKET_TCP;
+-	else if (type == SOCK_DGRAM) ftype = PR_DESC_SOCKET_UDP;
++	if (type == SOCK_STREAM)
++#if defined(ENABLE_SCTP)
++    if(proto == IPPROTO_SCTP)
++        ftype = PR_DESC_SOCKET_SCTP_ONE_TO_ONE;
++    else
++        ftype = PR_DESC_SOCKET_TCP;
++#else	
++	ftype = PR_DESC_SOCKET_TCP;
++#endif
++	else if (type == SOCK_DGRAM)
++	    ftype = PR_DESC_SOCKET_UDP;
+ 	else
+ 	{
+ 		(void)PR_SetError(PR_ADDRESS_NOT_SUPPORTED_ERROR, 0);
+ 		return fd;
+ 	}
+ #if defined(_PR_HAVE_SDP)
+ #if defined(LINUX)
+     if (PR_AF_INET_SDP == domain)
+@@ -4372,17 +4778,29 @@ PR_IMPLEMENT(PRFileDesc*) PR_NewTCPSocke
+ PR_IMPLEMENT(PRFileDesc*) PR_OpenUDPSocket(PRIntn af)
+ {
+     return PR_Socket(af, SOCK_DGRAM, 0);
+ }  /* PR_NewUDPSocket */
+ 
+ PR_IMPLEMENT(PRFileDesc*) PR_OpenTCPSocket(PRIntn af)
+ {
+     return PR_Socket(af, SOCK_STREAM, 0);
+-}  /* PR_NewTCPSocket */
++}  /* PR_openTCPSocket */
++
++#if defined(ENABLE_SCTP)
++PR_IMPLEMENT(PRFileDesc*) PR_OpenSCTPSocket(PRIntn af, PRInt32 type)
++{
++    return PR_Socket(af, type, IPPROTO_SCTP);
++}  /* PR_OpenSCTPSocket */
++
++PR_IMPLEMENT(PRFileDesc*) PR_OpenSCTPOneToOneSocket(PRIntn af)
++{
++    return PR_Socket(af, SOCK_STREAM, IPPROTO_SCTP);
++}  /* PR_OpenSCTPOneToOneSocket */
++#endif
+ 
+ PR_IMPLEMENT(PRStatus) PR_NewTCPSocketPair(PRFileDesc *fds[2])
+ {
+ #ifdef SYMBIAN
+     /*
+      * For the platforms that don't have socketpair.
+      *
+      * Copied from prsocket.c, with the parameter f[] renamed fds[] and the

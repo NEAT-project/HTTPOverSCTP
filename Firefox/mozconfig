@@ -1,0 +1,5 @@
+ac_add_options --enable-debug
+ac_add_options --enable-debug-symbols
+ac_add_options --disable-optimize
+ac_add_options --enable-sctp
+ac_add_options --disable-webrtc
