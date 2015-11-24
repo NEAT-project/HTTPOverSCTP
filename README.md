@@ -9,7 +9,7 @@ The patches were tested on Ubuntu.
 They are based on the work of Jonathan Leighton and Preethi Natarajan from the University of Delaware.
 
 A port of [phttpget.c](http://svnweb.freebsd.org/base/head/usr.sbin/portsnap/phttpget/phttpget.c)
-adding SCTP is provided in the file `phttpget.c`.
+adding SCTP support is provided in the file `phttpget.c`.
 It runs on FreeBSD and supports pipelining.
 
 ## Server
