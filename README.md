@@ -11,8 +11,8 @@ sources of wireshark.
 A port of the web server [thttpd](http://acme.com/software/thttpd/) adding SCTP support
 is available at [nplab/thttpd](https://github.com/nplab/thttpd). It runs on FreeBSD,
 Linux, MacOS X, and Solaris using a kernel SCTP stack and support IPv4 and IPv6.
-On FreeBSD and Mac OS X it supports also UDP encapsulation. An instance running on
-FreeBSD is reachable at [bsd10](http://bsd10.fh-muenster.de). It does currently
-supports neither persistent connections nor pipelining.
+On FreeBSD and Mac OS X it supports also UDP encapsulation.
+An instance running on FreeBSD is reachable at [bsd10](http://bsd10.fh-muenster.de).
+It currently supports neither persistent connections nor pipelining.
 
 
