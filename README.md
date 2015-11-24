@@ -15,4 +15,6 @@ On FreeBSD and Mac OS X it supports also UDP encapsulation.
 An instance running on FreeBSD is reachable at [bsd10](http://bsd10.fh-muenster.de).
 It currently supports neither persistent connections nor pipelining.
 
-
+A port of [phttpget.c](http://svnweb.freebsd.org/base/head/usr.sbin/portsnap/phttpget/phttpget.c)
+adding SCTP is provided in the file `phttpget.c`.
+It runs on FreeBSD and supports pipelining.
