@@ -7,6 +7,7 @@ Playground for running HTTP over SCTP experiments.
 The Firefox directory contains patches and files necessary for HTTP over SCTP support in firefox.
 The patches were tested on Ubuntu.
 They are based on the work of Jonathan Leighton and Preethi Natarajan from the University of Delaware.
+The original patches are available at [~leighton](https://www.eecis.udel.edu/~leighton/firefox.html).
 
 A port of [phttpget.c](http://svnweb.freebsd.org/base/head/usr.sbin/portsnap/phttpget/phttpget.c)
 adding SCTP support is provided in the file `phttpget.c`.
