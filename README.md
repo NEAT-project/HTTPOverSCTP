@@ -27,4 +27,9 @@ It currently supports neither persistent connections nor pipelining.
 The file `packet-http.c.patch` add support for HTTP/SCTP dissection to the current developer
 sources of wireshark.
 
+## Links and Papers
+
+* [draft-natarajan-http-over-sctp-02](https://tools.ietf.org/html/draft-natarajan-http-over-sctp-02).
+* [Mean Response Time Estimation for HTTP over SCTP in Wireless Environments](http://cs.ou.edu/~netlab/Pub/HTTP-over-SCTP-ICC06.pdf).
+* [Multistreamed Web Transport for Developing Regions](http://www.dritte.org/nsdr08/files/papers/s4p2.pdf).
 
