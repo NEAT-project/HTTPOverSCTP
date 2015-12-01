@@ -30,7 +30,18 @@
     * Handling of the transaction/stream table
     * pipelining support
     * a lot of debug output (not cleaned up yet)
-7. firefoxFreebsdBasic.patch
+7. SctpFirefoxLinuxDarwin.patch
+    * SCTP patch combining all the above Patches
+    * to run the sctp test in nsprpub/pr/tests do:
+      - change to nsprpub
+      - ./configure --enable-sctp --enable-64bit (if run on a 64 bit machine)
+      - make
+      - cd pr/tests
+      - make
+      - set environment variable DYLD_LIBRARY_PATH to ../../dist/lib
+      - ./sctp
+8. firefoxFreebsdBasic.patch
     * Independent Patch for FreeBsd
     * needed to get firefox compiled on FreeBsd
     * no code for SCTP yet
+
