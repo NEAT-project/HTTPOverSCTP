@@ -45,6 +45,7 @@
     * independent Patch for FreeBSD
     * needed to get Firefox compiled as described in [Simple Build](https://developer.mozilla.org/en-US/docs/Simple_Firefox_build)
     * no code for SCTP yet
+    * file icu-flags.mozbuild has to be copied to directory intl
 9. MacUdpEncaps.patch
     * UDP encapsulation for MacOsX
     * The tunneling port can be set in the browser at about:config network.http.sctp.udp-tunneling-port
