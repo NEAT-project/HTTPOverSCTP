@@ -31,6 +31,7 @@
     * pipelining support
     * a lot of debug output (not cleaned up yet)
 7. firefoxFreebsdBasic.patch
+    * Thanks to Jan Beich for providing hints and patches
     * independent Patch for FreeBSD
-    * needed to get the Firefox compiled as described in (Simple Build)[https://developer.mozilla.org/en-US/docs/Simple_Firefox_build]
+    * needed to get Firefox compiled as described in [Simple Build](https://developer.mozilla.org/en-US/docs/Simple_Firefox_build)
     * no code for SCTP yet
