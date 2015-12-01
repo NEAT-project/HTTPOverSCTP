@@ -45,4 +45,8 @@
     * independent Patch for FreeBSD
     * needed to get Firefox compiled as described in [Simple Build](https://developer.mozilla.org/en-US/docs/Simple_Firefox_build)
     * no code for SCTP yet
+9. MacUdpEncaps.patch
+    * UDP encapsulation for MacOsX
+    * The tunneling port can be set in the browser at about:config network.http.sctp.udp-tunneling-port
+    * The default tunneling port is 0, meaning no tunneling.
 

@@ -1,0 +1,562 @@
+diff --git a/configure.in b/configure.in
+--- a/configure.in
++++ b/configure.in
+@@ -2636,17 +2636,19 @@ if test -n "$ENABLE_SCTP"; then
+ fi
+ 
+ AC_SUBST(ENABLE_SCTP)
+ 
+     case "${target_os}" in
+     	darwin*)
+             AC_DEFINE(SCTP_HAVE_EXTRCVINFO)
+             AC_DEFINE(SCTP_1_BYTE_PEEK)
++            AC_DEFINE(SCTP_HAVE_UDP_ENCAPS)
+             LDFLAGS="$LDFLAGS -lsctp"
++            CFLAGS="$CFLAGS -DSCTP_HAVE_UDP_ENCAPS"
+             ;;
+     esac
+     
+ dnl SCTP support - needs various network include headers
+ MOZ_CHECK_HEADERS([linux/if_addr.h linux/rtnetlink.h],,,[#include <sys/socket.h>])
+ MOZ_CHECK_HEADERS(sys/queue.h)
+ 
+ MOZ_CHECK_HEADERS(sys/types.h netinet/in.h byteswap.h)
+diff --git a/modules/libpref/init/all.js b/modules/libpref/init/all.js
+--- a/modules/libpref/init/all.js
++++ b/modules/libpref/init/all.js
+@@ -4071,16 +4071,19 @@ pref("font.name.monospace.x-unicode", "d
+ #endif
+ 
+ #ifdef ENABLE_SCTP
+ pref("browser.startup.homepage_override.mstone", "ignore");
+ pref("network.http.pipelining"      , true);
+ pref("network.http.proxy.pipelining", true);
+ pref("network.http.pipelining.maxrequests" , 15);
+ pref("network.http.sctp.max-number-of-outgoing-streams" , 50);
++#if defined(SCTP_HAVE_UDP_ENCAPS)
++pref("network.http.sctp.udp-tunneling-port", 0);
++#endif
+ #endif
+ 
+ // Login Manager prefs
+ pref("signon.rememberSignons",              true);
+ pref("signon.rememberSignons.visibilityToggle", true);
+ pref("signon.autofillForms",                true);
+ pref("signon.autologin.proxy",              false);
+ pref("signon.storeWhenAutocompleteOff",     true);
+diff --git a/netwerk/base/nsSocketTransport2.cpp b/netwerk/base/nsSocketTransport2.cpp
+--- a/netwerk/base/nsSocketTransport2.cpp
++++ b/netwerk/base/nsSocketTransport2.cpp
+@@ -808,23 +808,26 @@ nsSocketTransport::nsSocketTransport()
+     , mFDref(0)
+     , mFDconnected(false)
+     , mSocketTransportService(gSocketTransportService)
+     , mInput(this)
+     , mOutput(this)
+     , mQoSBits(0x00)
+     , mKeepaliveEnabled(false)
+     , mKeepaliveIdleTimeS(-1)
+-    , mKeepaliveRetryIntervalS(-1)
+-    , mKeepaliveProbeCount(-1)
+ #ifdef ENABLE_SCTP
+     , mNextSctpInputStreamId (-1)
+     , mNextSctpOutputStreamId (-1)
+     , mNumberOfSctpStreams (-1)
++#if defined(SCTP_HAVE_UDP_ENCAPS)
++    , mUdpTunnelingPort(0)
+ #endif
++#endif
++    , mKeepaliveRetryIntervalS(-1)
++    , mKeepaliveProbeCount(-1)
+ {
+     SOCKET_LOG(("creating nsSocketTransport @%p\n", this));
+ 
+     mTimeouts[TIMEOUT_CONNECT]    = UINT16_MAX; // no timeout
+     mTimeouts[TIMEOUT_READ_WRITE] = UINT16_MAX; // no timeout
+ }
+ 
+ nsSocketTransport::~nsSocketTransport()
+@@ -1136,32 +1139,32 @@ nsSocketTransport::ResolveHost()
+         mState = STATE_RESOLVING;
+     }
+     return rv;
+ }
+ 
+ nsresult
+ nsSocketTransport::BuildSocket(PRFileDesc *&fd, bool &proxyTransparent, bool &usingSSL)
+ {
+-    SOCKET_LOG(("!!!!!!!!nsSocketTransport::BuildSocket [this=%p]\n", this));
++    SOCKET_LOG(("nsSocketTransport::BuildSocket [this=%p]\n", this));
+ 
+     nsresult rv;
+ 
+     proxyTransparent = false;
+     usingSSL = false;
+ 
+     if (mTypeCount == 0) {
+ #if defined(ENABLE_SCTP)
+         fd = PR_OpenSCTPOneToOneSocket(mNetAddr.raw.family);
+ #else
+         fd = PR_OpenTCPSocket(mNetAddr.raw.family);
+ #endif
+         rv = fd ? NS_OK : NS_ERROR_OUT_OF_MEMORY;
+ #if defined(ENABLE_SCTP)
+-        if (PR_GetDescType(PR_GetIdentitiesLayer(fd, PR_NSPR_IO_LAYER)) ==
++        if (fd && PR_GetDescType(PR_GetIdentitiesLayer(fd, PR_NSPR_IO_LAYER)) ==
+                 PR_DESC_SOCKET_SCTP_ONE_TO_ONE) {
+             if (NS_SUCCEEDED(rv)) {
+                 // Subscribe to sctp_data_io_event.
+                 PRSocketOptionData sod;
+                 memset(&sod, 0, sizeof(sod));
+                 sod.option = PR_SockOpt_Events;
+                 sod.value.events.sctp_data_io_event = 1;
+                 if (PR_SetSocketOption(fd, &sod) != PR_SUCCESS) {
+@@ -1200,16 +1203,36 @@ nsSocketTransport::BuildSocket(PRFileDes
+                 // Set the maximum number of outgoing SCTP streams.
+                 sod.value.initmsg.sinit_num_ostreams = (uint16_t) val;
+                 sod.option = PR_SockOpt_InitMsg;
+                 if (PR_SetSocketOption(fd, &sod) != PR_SUCCESS) {
+                     return NS_ERROR_SOCKET_OPTION_FAILED;
+                 }
+                 // Initialize next SCTP output stream ID.
+                 mNextSctpOutputStreamId = 0;
++
++#if defined(SCTP_HAVE_UDP_ENCAPS)
++                // Set UDP encapsulation port
++                val = 0;
++                if (mUdpTunnelingPort == 0) {
++                    rv = mSocketTransportService->GetUdpTunnelingPort(&val);
++                    if (NS_WARN_IF(NS_FAILED(rv))) {
++                        return rv;
++                    }
++                }
++                if (val > 0) {
++                    sod.option = PR_SockOpt_UdpEncaps;
++                    sod.value.udpencaps.sue_port = htons(val);
++                    sod.value.udpencaps.sue_assoc_id = 0;
++                    memcpy(&(sod.value.udpencaps.sue_address), &(mNetAddr), sizeof(PRNetAddr));
++                    if (PR_SetSocketOption(fd, &sod) != PR_SUCCESS) {
++                        return NS_ERROR_SOCKET_OPTION_FAILED;
++                    }
++                }
++#endif
+             }
+         }
+ #endif
+     }
+     else {
+ #if defined(XP_UNIX)
+         MOZ_ASSERT(!mNetAddrIsSet || mNetAddr.raw.family != AF_LOCAL,
+                    "Unix domain sockets can't be used with socket types");
+diff --git a/netwerk/base/nsSocketTransport2.h b/netwerk/base/nsSocketTransport2.h
+--- a/netwerk/base/nsSocketTransport2.h
++++ b/netwerk/base/nsSocketTransport2.h
+@@ -376,17 +376,19 @@ private:
+     // socket timeouts are not protected by any lock.
+     uint16_t mTimeouts[2];
+ 
+ #if defined(ENABLE_SCTP)
+         // SCTP Stream Id tracking information
+     int32_t  mNextSctpInputStreamId;   // Need to allow -1 as a legitimate value
+     uint16_t mNextSctpOutputStreamId;
+     uint16_t mNumberOfSctpStreams;
+-
++#if defined(SCTP_HAVE_UDP_ENCAPS)
++    uint16_t mUdpTunnelingPort;
++#endif
+     // Method to peek for SCTP stream id of next SCTP message to be read.
+     nsresult UpdateNextSctpInputStreamId();
+     nsresult SetNumberOfOutgoingSctpStreams(PRFileDesc *fd);
+ #endif
+     // QoS setting for socket
+     uint8_t mQoSBits;
+ 
+     //
+diff --git a/netwerk/base/nsSocketTransportService2.cpp b/netwerk/base/nsSocketTransportService2.cpp
+--- a/netwerk/base/nsSocketTransportService2.cpp
++++ b/netwerk/base/nsSocketTransportService2.cpp
+@@ -38,16 +38,19 @@ Atomic<PRThread*, Relaxed> gSocketThread
+ 
+ #define SEND_BUFFER_PREF "network.tcp.sendbuffer"
+ #define KEEPALIVE_ENABLED_PREF "network.tcp.keepalive.enabled"
+ #define KEEPALIVE_IDLE_TIME_PREF "network.tcp.keepalive.idle_time"
+ #define KEEPALIVE_RETRY_INTERVAL_PREF "network.tcp.keepalive.retry_interval"
+ #define KEEPALIVE_PROBE_COUNT_PREF "network.tcp.keepalive.probe_count"
+ #if defined(ENABLE_SCTP)
+ #define MAX_NUM_SCTP_STREAMS "network.http.sctp.max-number-of-outgoing-streams"
++#if defined(SCTP_HAVE_UDP_ENCAPS)
++#define UDP_TUNNELING_PORT "network.http.sctp.udp-tunneling-port"
++#endif
+ #endif
+ #define SOCKET_LIMIT_TARGET 550U
+ #define SOCKET_LIMIT_MIN     50U
+ #define BLIP_INTERVAL_PREF "network.activity.blipIntervalMilliseconds"
+ #define MAX_TIME_BETWEEN_TWO_POLLS "network.sts.max_time_for_events_between_two_polls"
+ #define TELEMETRY_PREF "toolkit.telemetry.enabled"
+ 
+ uint32_t nsSocketTransportService::gMaxCount;
+@@ -549,16 +552,19 @@ nsSocketTransportService::Init()
+         tmpPrefService->AddObserver(KEEPALIVE_ENABLED_PREF, this, false);
+         tmpPrefService->AddObserver(KEEPALIVE_IDLE_TIME_PREF, this, false);
+         tmpPrefService->AddObserver(KEEPALIVE_RETRY_INTERVAL_PREF, this, false);
+         tmpPrefService->AddObserver(KEEPALIVE_PROBE_COUNT_PREF, this, false);
+         tmpPrefService->AddObserver(MAX_TIME_BETWEEN_TWO_POLLS, this, false);
+         tmpPrefService->AddObserver(TELEMETRY_PREF, this, false);
+ #if defined(ENABLE_SCTP)
+         tmpPrefService->AddObserver(MAX_NUM_SCTP_STREAMS, this, false);
++#if defined(SCTP_HAVE_UDP_ENCAPS)
++        tmpPrefService->AddObserver(UDP_TUNNELING_PORT, this, false);
++#endif
+ #endif
+     }
+     UpdatePrefs();
+ 
+     nsCOMPtr<nsIObserverService> obsSvc = services::GetObserverService();
+     if (obsSvc) {
+         obsSvc->AddObserver(this, "profile-initial-state", false);
+         obsSvc->AddObserver(this, "last-pb-context-exited", false);
+@@ -686,16 +692,29 @@ nsSocketTransportService::GetMaxNumberOf
+ {
+     MOZ_ASSERT(aNumberOfSctpStreams);
+     if (NS_WARN_IF(!aNumberOfSctpStreams)) {
+         return NS_ERROR_NULL_POINTER;
+     }
+     *aNumberOfSctpStreams = mNumberOfSctpStreams;
+     return NS_OK;
+ }
++
++#if defined(SCTP_HAVE_UDP_ENCAPS)
++NS_IMETHODIMP
++nsSocketTransportService::GetUdpTunnelingPort(int32_t *aUdpTunnelingPort)
++{
++    MOZ_ASSERT(aUdpTunnelingPort);
++    if (NS_WARN_IF(!aUdpTunnelingPort)) {
++        return NS_ERROR_NULL_POINTER;
++    }
++    *aUdpTunnelingPort = mUdpTunnelingPort;
++    return NS_OK;
++}
++#endif
+ #endif
+ 
+ NS_IMETHODIMP
+ nsSocketTransportService::CreateTransport(const char **types,
+                                           uint32_t typeCount,
+                                           const nsACString &host,
+                                           int32_t port,
+                                           nsIProxyInfo *proxyInfo,
+@@ -1208,16 +1227,27 @@ nsSocketTransportService::UpdatePrefs()
+                                            1, kMaxTCPKeepCount);
+ #if defined(ENABLE_SCTP)
+         int32_t maxNumSctpStreams;
+         rv = tmpPrefService->GetIntPref(MAX_NUM_SCTP_STREAMS,
+                                         &maxNumSctpStreams);
+         if (NS_SUCCEEDED(rv))
+             mNumberOfSctpStreams = clamped(maxNumSctpStreams,
+                                            1, kMaxSCTPNumStreams);
++#if defined(SCTP_HAVE_UDP_ENCAPS)
++        int32_t udpTunnelingPort;
++        rv = tmpPrefService->GetIntPref(UDP_TUNNELING_PORT,
++                                        &udpTunnelingPort);
++        if (NS_SUCCEEDED(rv)) {
++            mUdpTunnelingPort = clamped(udpTunnelingPort,
++                                           0, kUdpTunnelingPort);
++        } else {
++            SOCKET_LOG(("nsSocketTransportService::mUdpTunnelingPort could not be set"));
++        }
++#endif
+ #endif
+         bool keepaliveEnabled = false;
+         rv = tmpPrefService->GetBoolPref(KEEPALIVE_ENABLED_PREF,
+                                          &keepaliveEnabled);
+         if (NS_SUCCEEDED(rv) && keepaliveEnabled != mKeepaliveEnabledPref) {
+             mKeepaliveEnabledPref = keepaliveEnabled;
+             OnKeepaliveEnabledPrefChange();
+         }
+diff --git a/netwerk/base/nsSocketTransportService2.h b/netwerk/base/nsSocketTransportService2.h
+--- a/netwerk/base/nsSocketTransportService2.h
++++ b/netwerk/base/nsSocketTransportService2.h
+@@ -48,16 +48,19 @@ extern mozilla::LazyLogModule gUDPSocket
+ namespace mozilla {
+ namespace net {
+ // These maximums are borrowed from the linux kernel.
+ static const int32_t kMaxTCPKeepIdle  = 32767; // ~9 hours.
+ static const int32_t kMaxTCPKeepIntvl = 32767;
+ static const int32_t kMaxTCPKeepCount   = 127;
+ #if defined(ENABLE_SCTP)
+ static const int32_t kMaxSCTPNumStreams = 65535;
++#if defined(SCTP_HAVE_UDP_ENCAPS)
++static const int32_t kUdpTunnelingPort = 9899;
++#endif
+ #endif
+ static const int32_t kDefaultTCPKeepCount =
+ #if defined (XP_WIN)
+                                               10; // Hardcoded in Windows.
+ #elif defined (XP_MACOSX)
+                                               8;  // Hardcoded in OSX.
+ #else
+                                               4;  // Specifiable in Linux.
+@@ -115,16 +118,19 @@ public:
+     uint64_t GetReceivedBytes() { return mReceivedBytesCount; }
+ 
+     // Returns true if keepalives are enabled in prefs.
+     bool IsKeepaliveEnabled() { return mKeepaliveEnabledPref; }
+ 
+     bool IsTelemetryEnabled() { return mTelemetryEnabledPref; }
+ #if defined(ENABLE_SCTP)
+     NS_IMETHODIMP GetMaxNumberOfSctpStreams(int32_t *aNumberOfSctpStreams);
++#if defined(SCTP_HAVE_UDP_ENCAPS)
++    NS_IMETHODIMP GetUdpTunnelingPort(int32_t *aUdpTunnelingPort);
++#endif
+ #endif
+ protected:
+ 
+     virtual ~nsSocketTransportService();
+ 
+ private:
+ 
+     //-------------------------------------------------------------------------
+@@ -240,16 +246,19 @@ private:
+     int32_t     mKeepaliveRetryIntervalS;
+     // Number of keepalive probes to send.
+     int32_t     mKeepaliveProbeCount;
+     // True if TCP keepalive is enabled globally.
+     bool        mKeepaliveEnabledPref;
+ 
+ #if defined(ENABLE_SCTP)
+     uint16_t mNumberOfSctpStreams;
++#if defined(SCTP_HAVE_UDP_ENCAPS)
++    uint16_t mUdpTunnelingPort;
++#endif
+ #endif
+ 
+     mozilla::Atomic<bool>  mServingPendingQueue;
+     mozilla::Atomic<int32_t, mozilla::Relaxed> mMaxTimePerPollIter;
+     mozilla::Atomic<bool, mozilla::Relaxed>  mTelemetryEnabledPref;
+ 
+     void OnKeepaliveEnabledPrefChange();
+     void NotifyKeepaliveEnabledPrefChange(SocketContext *sock);
+diff --git a/nsprpub/configure b/nsprpub/configure
+--- a/nsprpub/configure
++++ b/nsprpub/configure
+@@ -8602,16 +8602,21 @@ done
+           CFLAGS_SAVE=$CFLAGS
+ 
+                     case "$target" in
+           *-linux*)
+               USE_LIBSCTP=1
+               ;;
+           *-darwin*)
+               USE_LIBSCTP=1
++              { $as_echo "$as_me:${as_lineno-$LINENO}: checking set SCTP_HAVE_UDP_ENCAPS" >&5
++$as_echo_n "checking set SCTP_HAVE_UDP_ENCAPS... " >&6; }
++              $as_echo "#define SCTP_HAVE_UDP_ENCAPS 1" >>confdefs.h
++
++              CFLAGS="$CFLAGS -DSCTP_HAVE_UDP_ENCAPS"
+               ;;
+           *)
+                             as_fn_error $? " --enable-sctp option not supported for this target system" "$LINENO" 5;
+               ;;
+           esac
+ 
+                     if test -n "$USE_LIBSCTP"; then
+               LDOPTS="$LDOPTS -lsctp"
+diff --git a/nsprpub/configure.in b/nsprpub/configure.in
+--- a/nsprpub/configure.in
++++ b/nsprpub/configure.in
+@@ -2989,16 +2989,19 @@ dnl          AC_CHECK_HEADERS([sys/types
+ 
+           dnl - do OS based checks and configuration.
+           case "$target" in
+           *-linux*)
+               USE_LIBSCTP=1
+               ;;
+           *-darwin*)
+               USE_LIBSCTP=1
++              AC_MSG_CHECKING(set SCTP_HAVE_UDP_ENCAPS)
++              AC_DEFINE(SCTP_HAVE_UDP_ENCAPS)
++              CFLAGS="$CFLAGS -DSCTP_HAVE_UDP_ENCAPS"
+               ;;
+           *)
+               dnl - unknown system
+               AC_MSG_ERROR([ --enable-sctp option not supported for this target system]);
+               ;;
+           esac
+ 
+           dnl - check for SCTP support
+diff --git a/nsprpub/pr/include/prio.h b/nsprpub/pr/include/prio.h
+--- a/nsprpub/pr/include/prio.h
++++ b/nsprpub/pr/include/prio.h
+@@ -225,16 +225,19 @@ typedef enum PRSockOption
+     PR_SockOpt_Events,             /* enable/disable sndrcvinfo notifications */
+     PR_SockOpt_InitMsg,            /* get/set INIT chunk parameters */
+     PR_SockOpt_AssocInfo,          /* get/set/change association info */
+     PR_SockOpt_SctpNoDelay,        /* enable/disable Nagle algorithm */
+     PR_SockOpt_SctpMaxSegment,     /* get/set maximum fragment size */
+     PR_SockOpt_Status,             /* get current state of association */
+     PR_SockOpt_SetPeerPrimaryAddr, /* set primary address of peer */
+     PR_SockOpt_SetPrimaryAddr,     /* set primary address */
++#if defined(SCTP_HAVE_UDP_ENCAPS)
++    PR_SockOpt_UdpEncaps,		   /* enable UDP encapsulation and set remote encapsulation port */
++#endif
+ #endif
+     PR_SockOpt_Last
+ } PRSockOption;
+ 
+ typedef struct PRLinger {
+ 	PRBool polarity;		    /* Polarity of the option's setting */
+ 	PRIntervalTime linger;	    /* Time to linger before closing */
+ } PRLinger;
+@@ -274,16 +277,19 @@ typedef struct PRSocketOptionData
+         PRSctp_Event_Subscribe events;  /* enable/disable sendrcvinfo messages */
+         PRSctp_InitMsg initmsg;         /* get/set INIT chunk parameters */
+         PRSctp_AssocParams assocparams; /* get/set/change association info */
+         PRBool sctp_nodelay;            /* enable/disable Nagle algorithm */
+         PRSctp_Assoc_Value sctp_maxseg; /* set/get max fragment size */
+         PRSctp_Status status;           /* get current state of association */
+         PRSctp_SetPeerPrim setpeerprim; /* set primary address of peer */
+         PRSctp_SetPrim setprim;         /* set primary address */
++#if defined(SCTP_HAVE_UDP_ENCAPS)
++        PRSctp_UdpEncaps udpencaps;		/* set UDP encapsulation port */
++#endif
+ #endif
+     } value;
+ } PRSocketOptionData;
+ 
+ /*
+ ***************************************************************************
+ ** PRIOVec
+ **
+diff --git a/nsprpub/pr/include/prsctp.h b/nsprpub/pr/include/prsctp.h
+--- a/nsprpub/pr/include/prsctp.h
++++ b/nsprpub/pr/include/prsctp.h
+@@ -141,16 +141,23 @@ typedef struct PRSctp_SetPeerPrim {     
+         PRNetAddr                sspp_addr;
+ } PRSctp_SetPeerPrim;
+ 
+ typedef struct PRSctp_Assoc_Value {               /* Doesn't exist on Solaris */
+         sctp_assoc_t  assoc_id;
+         PRUint32      assoc_value;
+ } PRSctp_Assoc_Value;
+ 
++#if defined(SCTP_HAVE_UDP_ENCAPS)
++typedef struct PRSctp_UdpEncaps {
++        PRNetAddr sue_address;
++        sctp_assoc_t sue_assoc_id;
++        PRUint16 sue_port;
++} PRSctp_UdpEncaps;
++#endif
+ #else /* ! ENABLE_SCTP */
+ 
+ /* Dummy definition */
+ typedef struct PRSctp_SndRcvInfo {
+         PRUint32     nosctp;
+ } PRSctp_SndRcvInfo;
+ 
+ #endif /* ! ENABLE_SCTP */
+diff --git a/nsprpub/pr/src/io/prmapopt.c b/nsprpub/pr/src/io/prmapopt.c
+--- a/nsprpub/pr/src/io/prmapopt.c
++++ b/nsprpub/pr/src/io/prmapopt.c
+@@ -471,31 +471,36 @@ PRStatus _PR_MapOptionName(
+     {
+         0, SO_LINGER, SO_REUSEADDR, SO_KEEPALIVE, SO_RCVBUF, SO_SNDBUF,
+         IP_TTL, IP_TOS, IP_ADD_MEMBERSHIP, IP_DROP_MEMBERSHIP,
+         IP_MULTICAST_IF, IP_MULTICAST_TTL, IP_MULTICAST_LOOP,
+ #if defined(ENABLE_SCTP)
+         TCP_NODELAY, TCP_MAXSEG, SO_BROADCAST, SO_REUSEPORT,
+         SCTP_DEFAULT_SEND_PARAM, SCTP_USE_EXT_RCVINFO, SCTP_EVENTS, 
+         SCTP_INITMSG, SCTP_ASSOCINFO, SCTP_NODELAY, SCTP_MAXSEG, 
+-        SCTP_STATUS, SCTP_SET_PEER_PRIMARY_ADDR, SCTP_SET_PRIMARY_ADDR
++        SCTP_STATUS, SCTP_SET_PEER_PRIMARY_ADDR, SCTP_SET_PRIMARY_ADDR,
++#if defined(SCTP_HAVE_UDP_ENCAPS)
++		SCTP_REMOTE_UDP_ENCAPS_PORT
++#endif
+ #else
+         TCP_NODELAY, TCP_MAXSEG, SO_BROADCAST, SO_REUSEPORT
+ #endif
+     };
+     static PRInt32 socketLevels[PR_SockOpt_Last] =
+     {
+         0, SOL_SOCKET, SOL_SOCKET, SOL_SOCKET, SOL_SOCKET, SOL_SOCKET,
+         IPPROTO_IP, IPPROTO_IP, IPPROTO_IP, IPPROTO_IP,
+         IPPROTO_IP, IPPROTO_IP, IPPROTO_IP,
+ #if defined(ENABLE_SCTP)
+         IPPROTO_TCP, IPPROTO_TCP, SOL_SOCKET, SOL_SOCKET, IPPROTO_SCTP,
+         IPPROTO_SCTP, IPPROTO_SCTP, IPPROTO_SCTP, IPPROTO_SCTP,	
+-        IPPROTO_SCTP, IPPROTO_SCTP, IPPROTO_SCTP, IPPROTO_SCTP,
++        IPPROTO_SCTP, IPPROTO_SCTP, IPPROTO_SCTP, IPPROTO_SCTP, IPPROTO_SCTP,
++#if defined(SCTP_HAVE_UDP_ENCAPS)
+         IPPROTO_SCTP
++#endif
+ #else
+         IPPROTO_TCP, IPPROTO_TCP, SOL_SOCKET, SOL_SOCKET
+ #endif
+     };
+ 
+     if ((optname < PR_SockOpt_Linger)
+     || (optname >= PR_SockOpt_Last))
+     {
+diff --git a/nsprpub/pr/src/md/unix/darwin.c b/nsprpub/pr/src/md/unix/darwin.c
+--- a/nsprpub/pr/src/md/unix/darwin.c
++++ b/nsprpub/pr/src/md/unix/darwin.c
+@@ -434,16 +434,37 @@ PRInt32 _MD_SCTPSetSocketOption(PRFileDe
+                     md_setprim.ssp_addr.ss_len = sizeof(struct sockaddr_in6);
+                 /* Must correct ss_family after memcpy. */
+                 md_setprim.ssp_addr.ss_family =
+                     data->value.setprim.ssp_addr.raw.family;
+                 rv = setsockopt(fd->secret->md.osfd, level, name, (void *)&md_setprim,
+                                 length);
+                 break;
+             }
++#if defined(SCTP_HAVE_UDP_ENCAPS)
++            case PR_SockOpt_UdpEncaps:
++            {
++            	struct sctp_udpencaps md_setudpencaps;
++            	length = sizeof(md_setudpencaps);
++            	memset(&md_setudpencaps, 0, length);
++            	md_setudpencaps.sue_assoc_id = data->value.udpencaps.sue_assoc_id;
++            	memcpy(&(md_setudpencaps.sue_address),
++                       &(data->value.udpencaps.sue_address), sizeof(PRNetAddr));
++        		if (AF_INET == data->value.udpencaps.sue_address.raw.family)
++                    md_setudpencaps.sue_address.ss_len = sizeof(struct sockaddr_in);
++                else
++                    md_setudpencaps.sue_address.ss_len = sizeof(struct sockaddr_in6);
++                /* Must correct ss_family after memcpy. */
++                md_setudpencaps.sue_address.ss_family =
++                    data->value.udpencaps.sue_address.raw.family;
++        		md_setudpencaps.sue_port = data->value.udpencaps.sue_port;
++        		rv = setsockopt(fd->secret->md.osfd, level, name, (void *)&md_setudpencaps, length);
++        		break;
++        	}
++#endif
+             default:
+                 PR_NOT_REACHED("Unknown socket option");
+                 break;
+         }
+         return rv;
+     }
+     return -1;    /* PR_MapOptionName returned PR_FAILURE - should never happen here. */
+ }
+diff --git a/nsprpub/pr/src/pthreads/ptio.c b/nsprpub/pr/src/pthreads/ptio.c
+--- a/nsprpub/pr/src/pthreads/ptio.c
++++ b/nsprpub/pr/src/pthreads/ptio.c
+@@ -3339,16 +3339,19 @@ static PRStatus pt_SetSocketOption(PRFil
+             */
+             case PR_SockOpt_DefaultSendParam:
+             case PR_SockOpt_Events:
+             case PR_SockOpt_InitMsg:
+             case PR_SockOpt_AssocInfo:
+             case PR_SockOpt_SctpMaxSegment:
+             case PR_SockOpt_SetPeerPrimaryAddr:
+             case PR_SockOpt_SetPrimaryAddr:
++#if defined(SCTP_HAVE_UDP_ENCAPS)
++            case PR_SockOpt_UdpEncaps:
++#endif
+             {
+                 rv = _PR_MD_SCTPSETSOCKETOPTION(fd, data);
+                 break;
+             }
+             case PR_SockOpt_Status:
+             {
+                 PR_NOT_REACHED("SCTP_STATUS socket option is \"Get\" only");
+                 break;
