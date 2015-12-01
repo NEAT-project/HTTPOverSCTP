@@ -30,3 +30,7 @@
     * Handling of the transaction/stream table
     * pipelining support
     * a lot of debug output (not cleaned up yet)
+7. firefoxFreebsdBasic.patch
+    * Independent Patch for FreeBsd
+    * needed to get firefox compiled on FreeBsd
+    * no code for SCTP yet
