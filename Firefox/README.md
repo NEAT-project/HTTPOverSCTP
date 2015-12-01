@@ -41,7 +41,8 @@
       - set environment variable DYLD_LIBRARY_PATH to ../../dist/lib
       - ./sctp
 8. firefoxFreebsdBasic.patch
-    * Independent Patch for FreeBsd
-    * needed to get firefox compiled on FreeBsd
+    * Thanks to Jan Beich for providing hints and patches
+    * independent Patch for FreeBSD
+    * needed to get Firefox compiled as described in [Simple Build](https://developer.mozilla.org/en-US/docs/Simple_Firefox_build)
     * no code for SCTP yet
 
