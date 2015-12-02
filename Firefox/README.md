@@ -50,4 +50,7 @@
     * UDP encapsulation for MacOsX
     * The tunneling port can be set in the browser at about:config network.http.sctp.udp-tunneling-port
     * The default tunneling port is 0, meaning no tunneling.
-
+10. SCTPFreeBSD.patch
+    * Adding SCTP support for FreeBSD
+    * Includes support for Linux and Darwin
+    * Includes SctpFirefoxLinuxDarwin.patch
