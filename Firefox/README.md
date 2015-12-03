@@ -1,5 +1,11 @@
 # Patches for HTTP over SCTP in Firefox
 
+The patches 1 to 6 are incremental.
+Patch 7 combines te patches 1 to 6.
+Patch 9 introduces UDP encapsulation for SCTP on Mac.
+Patch 8 is a basic patch for FreeBSD to allow an initial build.
+Patches 10 and 11 contain the code for Linux, Mac and FreeBSD for SCTP and UDP tunneling.
+
 1. nsprpubOhnePrsctp.patch
    * SCTP support and nrprpub
    * nsprpub/pr/include/prsctp.h has to be added
@@ -50,4 +56,10 @@
     * UDP encapsulation for MacOsX
     * The tunneling port can be set in the browser at about:config network.http.sctp.udp-tunneling-port
     * The default tunneling port is 0, meaning no tunneling.
-
+10. SCTPFreeBSD.patch
+    * Adding SCTP support for FreeBSD
+    * Includes support for Linux and Darwin
+    * Includes SctpFirefoxLinuxDarwin.patch
+11. UDPTunnelingFreeBSDMac.patch
+    * UDP encapsulation for FreeBSD
+    * includes UDP encapsulation for Mac
