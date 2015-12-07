@@ -24,9 +24,15 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#ifdef __FreeBSD__
 #include <sys/cdefs.h>
 __FBSDID("$FreeBSD: head/usr.sbin/portsnap/phttpget/phttpget.c 190679 2009-04-03 21:13:18Z cperciva $");
+#endif
 
+#ifdef linux
+#define _GNU_SOURCE
+#define OFF_MAX LONG_MAX
+#endif
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/socket.h>
@@ -54,6 +60,29 @@ static const char *	proxyport;
 static char *		proxyauth;
 
 static struct timeval	timo = { 15, 0};
+
+#ifndef __FreeBSD__
+char *
+strnstr(const char *s, const char *find, size_t slen)
+{
+	char c, sc;
+	size_t len;
+
+	if ((c = *find++) != '\0') {
+		len = strlen(find);
+		do {
+			do {
+				if (slen-- < 1 || (sc = *s++) == '\0')
+					return (NULL);
+			} while (sc != c);
+			if (len > slen)
+				return (NULL);
+		} while (strncmp(s, find, len) != 0);
+		s--;
+	}
+	return ((char *)s);
+}
+#endif
 
 static void
 usage(void)
@@ -295,7 +324,9 @@ main(int argc, char *argv[])
 	struct addrinfo hints;		/* Hints to getaddrinfo */
 	struct addrinfo *res;		/* Pointer to server address being used */
 	struct addrinfo *res0;		/* Pointer to server addresses */
+#ifdef SCTP_REMOTE_UDP_ENCAPS_PORT
 	struct sctp_udpencaps encaps;	/* SCTP/UDP information */
+#endif
 	char * resbuf = NULL;		/* Response buffer */
 	int resbufpos = 0;		/* Response buffer position */
 	int resbuflen = 0;		/* Response buffer length */
@@ -344,8 +375,14 @@ main(int argc, char *argv[])
 	hints.ai_family = PF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
 	hints.ai_protocol = IPPROTO_SCTP;
+#ifdef __FreeBSD__
 	error = getaddrinfo(env_HTTP_PROXY ? env_HTTP_PROXY : servername,
 	    env_HTTP_PROXY ? proxyport : "http", &hints, &res0);
+#else
+	/* Not all OSes have an SCTP entry for HTTP in /etc/services yet. */
+	error = getaddrinfo(env_HTTP_PROXY ? env_HTTP_PROXY : servername,
+	    env_HTTP_PROXY ? proxyport : "80", &hints, &res0);
+#endif
 	if (error)
 		errx(1, "host = %s, port = %s: %s",
 		    env_HTTP_PROXY ? env_HTTP_PROXY : servername,
@@ -375,6 +412,7 @@ main(int argc, char *argv[])
 			setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO,
 			    (void *)&timo, (socklen_t)sizeof(timo));
 
+#ifdef SCTP_REMOTE_UDP_ENCAPS_PORT
 			/* Use UDP encapsulation for SCTP */
 			memset(&encaps, 0, sizeof(encaps));
 			encaps.sue_address.ss_family = res->ai_family;
@@ -383,14 +421,17 @@ main(int argc, char *argv[])
 			setsockopt(sd, 
 			    IPPROTO_SCTP, SCTP_REMOTE_UDP_ENCAPS_PORT,
 			    (void *)&encaps, (socklen_t)sizeof(encaps));
+#endif
 
+#ifdef SO_NOSIGPIPE
 			/* ... disable SIGPIPE generation ... */
 			val = 1;
 			setsockopt(sd, SOL_SOCKET, SO_NOSIGPIPE,
 			    (void *)&val, sizeof(int));
+#endif
 
 			/* ... and connect to the server. */
-			if(connect(sd, res->ai_addr, res->ai_addrlen)) {
+			if (connect(sd, res->ai_addr, res->ai_addrlen)) {
 				close(sd);
 				sd = -1;
 				continue;
