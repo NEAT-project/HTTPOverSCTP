@@ -56,10 +56,15 @@ static const char *	env_HTTP_PROXY;
 static char *		env_HTTP_PROXY_AUTH;
 static const char *	env_HTTP_USER_AGENT;
 static char *		env_HTTP_TIMEOUT;
+static char *		env_HTTP_TRANSPORT_PROTOCOL;
+static char *		env_HTTP_SCTP_UDP_ENCAPS_PORT;
 static const char *	proxyport;
 static char *		proxyauth;
 
 static struct timeval	timo = { 15, 0};
+
+static in_port_t	udp_encaps_port = 0;
+static int		protocol = IPPROTO_TCP;
 
 #ifndef __FreeBSD__
 char *
@@ -157,6 +162,7 @@ readenv(void)
 	char *proxy_auth_user = NULL;
 	char *proxy_auth_pass = NULL;
 	long http_timeout;
+	long port;
 
 	env_HTTP_PROXY = getenv("HTTP_PROXY");
 	if (env_HTTP_PROXY == NULL)
@@ -223,6 +229,27 @@ readenv(void)
 			    env_HTTP_TIMEOUT);
 		else
 			timo.tv_sec = http_timeout;
+	}
+	env_HTTP_TRANSPORT_PROTOCOL = getenv("HTTP_TRANSPORT_PROTOCOL");
+	if (env_HTTP_TRANSPORT_PROTOCOL != NULL) {
+		if (strncasecmp(env_HTTP_TRANSPORT_PROTOCOL, "TCP", 3) == 0)
+			protocol = IPPROTO_TCP;
+		else if (strncasecmp(env_HTTP_TRANSPORT_PROTOCOL, "SCTP", 4) == 0)
+			protocol = IPPROTO_SCTP;
+		else
+			warnx("HTTP_TRANSPORT_PROTOCOL (%s) not supported",
+			    env_HTTP_TRANSPORT_PROTOCOL);
+	}
+
+	env_HTTP_SCTP_UDP_ENCAPS_PORT = getenv("HTTP_SCTP_UDP_ENCAPS_PORT");
+	if (env_HTTP_SCTP_UDP_ENCAPS_PORT != NULL) {
+		port = strtol(env_HTTP_SCTP_UDP_ENCAPS_PORT, &p, 10);
+		if ((*env_HTTP_SCTP_UDP_ENCAPS_PORT == '\0') || (*p != '\0') ||
+		    (port <= 0) || (port > 65535))
+			warnx("HTTP_SCTP_UDP_ENCAPS_PORT (%s) is not a valid port number",
+			    env_HTTP_SCTP_UDP_ENCAPS_PORT);
+		else
+			udp_encaps_port = (in_port_t)port;
 	}
 }
 
@@ -374,7 +401,7 @@ main(int argc, char *argv[])
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = PF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_protocol = IPPROTO_SCTP;
+	hints.ai_protocol = protocol;
 #ifdef __FreeBSD__
 	error = getaddrinfo(env_HTTP_PROXY ? env_HTTP_PROXY : servername,
 	    env_HTTP_PROXY ? proxyport : "http", &hints, &res0);
@@ -412,16 +439,21 @@ main(int argc, char *argv[])
 			setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO,
 			    (void *)&timo, (socklen_t)sizeof(timo));
 
+			if (protocol == IPPROTO_SCTP) {
 #ifdef SCTP_REMOTE_UDP_ENCAPS_PORT
-			/* Use UDP encapsulation for SCTP */
-			memset(&encaps, 0, sizeof(encaps));
-			encaps.sue_address.ss_family = res->ai_family;
-			encaps.sue_address.ss_len = res->ai_addrlen;
-			encaps.sue_port = htons(9899);
-			setsockopt(sd, 
-			    IPPROTO_SCTP, SCTP_REMOTE_UDP_ENCAPS_PORT,
-			    (void *)&encaps, (socklen_t)sizeof(encaps));
+				/* Use UDP encapsulation for SCTP */
+				memset(&encaps, 0, sizeof(encaps));
+				encaps.sue_address.ss_family = res->ai_family;
+				encaps.sue_address.ss_len = res->ai_addrlen;
+				encaps.sue_port = htons(udp_encaps_port);
+				setsockopt(sd,
+				    IPPROTO_SCTP, SCTP_REMOTE_UDP_ENCAPS_PORT,
+				    (void *)&encaps, (socklen_t)sizeof(encaps));
+#else
+				if (udp_encaps_port > 0)
+					errx(1, "UDP encapsulation not supported");
 #endif
+			}
 
 #ifdef SO_NOSIGPIPE
 			/* ... disable SIGPIPE generation ... */
