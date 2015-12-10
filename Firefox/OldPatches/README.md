@@ -63,3 +63,5 @@ Patches 10 and 11 contain the code for Linux, Mac and FreeBSD for SCTP and UDP t
 11. UDPTunnelingFreeBSDMac.patch
     * UDP encapsulation for FreeBSD
     * includes UDP encapsulation for Mac
+12. SctpPreference.patch
+    * SCTP can be switched on or off in about:config
