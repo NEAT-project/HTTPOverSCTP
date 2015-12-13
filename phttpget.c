@@ -246,7 +246,7 @@ readenv(void)
 	if (env_HTTP_SCTP_UDP_ENCAPS_PORT != NULL) {
 		port = strtol(env_HTTP_SCTP_UDP_ENCAPS_PORT, &p, 10);
 		if ((*env_HTTP_SCTP_UDP_ENCAPS_PORT == '\0') || (*p != '\0') ||
-		    (port <= 0) || (port > 65535))
+		    (port < 0) || (port > 65535))
 			warnx("HTTP_SCTP_UDP_ENCAPS_PORT (%s) is not a valid port number",
 			    env_HTTP_SCTP_UDP_ENCAPS_PORT);
 		else
