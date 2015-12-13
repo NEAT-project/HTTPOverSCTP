@@ -23,7 +23,8 @@ variable. Supported values are `0`, ..., `65535`. If it is unset or set to `0`, 
 is used. Please note that for using UDP encapsulation, the local UDP encapsulation port must also be set
 to a non-zero value. You can use `sudo sysctl -w net.inet.sctp.udp_tunneling_port=9899` on FreeBSD.
 Please note that UDP encapsulation is only supported on FreeBSD and MacOS X (with the SCTP NKE).
-The following should work on FreeBSD using a tcsh:
+
+The following example should work on FreeBSD using a tcsh:
 ```
 env HTTP_TRANSPORT_PROTOCOL=SCTP HTTP_SCTP_UDP_ENCAPS_PORT=9899 phttpget bsd10.fh-muenster.de index.html
 ```
