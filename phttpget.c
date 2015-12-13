@@ -163,6 +163,7 @@ readenv(void)
 	char *proxy_auth_pass = NULL;
 	long http_timeout;
 	long port;
+	int buflen;
 
 	env_HTTP_PROXY = getenv("HTTP_PROXY");
 	if (env_HTTP_PROXY == NULL)
@@ -197,18 +198,18 @@ readenv(void)
 	}
 
 	if ((proxy_auth_user != NULL) && (proxy_auth_pass != NULL)) {
-		asprintf(&proxy_auth_userpass, "%s:%s",
+		buflen = asprintf(&proxy_auth_userpass, "%s:%s",
 		    proxy_auth_user, proxy_auth_pass);
-		if (proxy_auth_userpass == NULL)
+		if (buflen == -1)
 			err(1, "asprintf");
 
 		proxy_auth_userpass64 = b64enc(proxy_auth_userpass);
 		if (proxy_auth_userpass64 == NULL)
 			err(1, "malloc");
 
-		asprintf(&proxyauth, "Proxy-Authorization: Basic %s\r\n",
+		buflen = asprintf(&proxyauth, "Proxy-Authorization: Basic %s\r\n",
 		    proxy_auth_userpass64);
-		if (proxyauth == NULL)
+		if (buflen == -1)
 			err(1, "asprintf");
 
 		free(proxy_auth_userpass);
