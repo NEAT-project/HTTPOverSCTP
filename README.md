@@ -33,7 +33,7 @@ env HTTP_TRANSPORT_PROTOCOL=SCTP HTTP_SCTP_UDP_ENCAPS_PORT=9899 phttpget bsd10.f
 
 A port of the web server [thttpd](http://acme.com/software/thttpd/) adding SCTP support
 is available at [nplab/thttpd](https://github.com/nplab/thttpd). It runs on FreeBSD,
-Linux, MacOS X, and Solaris using a kernel SCTP stack and support IPv4 and IPv6.
+Linux, MacOS X, and Solaris using a kernel SCTP stack and supports IPv4 and IPv6.
 On FreeBSD and Mac OS X it supports also UDP encapsulation.
 An instance running on FreeBSD is reachable at [bsd10](http://bsd10.fh-muenster.de).
 It currently supports neither persistent connections nor pipelining.
