@@ -6,7 +6,7 @@ Playground for running HTTP over SCTP experiments.
 
 ### Firefox Nightly
 The Firefox directory contains patches and files necessary for HTTP over SCTP support in firefox.
-The patches were tested on Ubuntu.
+The patches were tested on Ubuntu, FreeBSD 10.2 and Mac OS X 10.10.
 They are based on the work of Jonathan Leighton and Preethi Natarajan from the University of Delaware.
 The original patches are available at [~leighton](https://www.eecis.udel.edu/~leighton/firefox.html).
 
