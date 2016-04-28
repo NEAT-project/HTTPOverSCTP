@@ -1,0 +1,113 @@
+diff -ur curl-7.48.0/include/curl/curl.h curl-7.48.0.mod/include/curl/curl.h
+--- curl-7.48.0/include/curl/curl.h	2016-03-22 07:15:38.000000000 +0000
++++ curl-7.48.0.mod/include/curl/curl.h	2016-04-28 11:46:53.028508007 +0100
+@@ -1676,6 +1676,9 @@
+   /* Do not send any tftp option requests to the server */
+   CINIT(TFTP_NO_OPTIONS, LONG, 242),
+ 
++  /* Set SCTP as transport rather than TCP */
++  CINIT(ENABLE_SCTP, LONG, 243),
++
+   CURLOPT_LASTENTRY /* the last unused */
+ } CURLoption;
+ 
+diff -ur curl-7.48.0/lib/connect.c curl-7.48.0.mod/lib/connect.c
+--- curl-7.48.0/lib/connect.c	2016-03-22 07:15:38.000000000 +0000
++++ curl-7.48.0.mod/lib/connect.c	2016-04-28 12:24:45.304024330 +0100
+@@ -1326,6 +1326,8 @@
+   addr->family = ai->ai_family;
+   addr->socktype = conn->socktype;
+   addr->protocol = conn->socktype==SOCK_DGRAM?IPPROTO_UDP:ai->ai_protocol;
++  if(conn->data->set.sctp)
++     addr->protocol = IPPROTO_SCTP;
+   addr->addrlen = ai->ai_addrlen;
+ 
+   if(addr->addrlen > sizeof(struct Curl_sockaddr_storage))
+diff -ur curl-7.48.0/lib/url.c curl-7.48.0.mod/lib/url.c
+--- curl-7.48.0/lib/url.c	2016-03-22 07:15:38.000000000 +0000
++++ curl-7.48.0.mod/lib/url.c	2016-04-28 12:14:13.702312662 +0100
+@@ -2696,6 +2696,9 @@
+     break;
+ #endif
+   }
++  case CURLOPT_ENABLE_SCTP:
++    data->set.sctp = TRUE;
++    break;
+   default:
+     /* unknown tag and its companion, just ignore: */
+     result = CURLE_UNKNOWN_OPTION;
+diff -ur curl-7.48.0/lib/urldata.h curl-7.48.0.mod/lib/urldata.h
+--- curl-7.48.0/lib/urldata.h	2016-03-22 07:15:38.000000000 +0000
++++ curl-7.48.0.mod/lib/urldata.h	2016-04-28 12:13:05.386557914 +0100
+@@ -1584,6 +1584,7 @@
+   bool ftp_use_epsv;     /* if EPSV is to be attempted or not */
+   bool ftp_use_eprt;     /* if EPRT is to be attempted or not */
+   bool ftp_use_pret;     /* if PRET is to be used before PASV or not */
++  bool sctp;             /* Enable SCTP rather than TCP */
+ 
+   curl_usessl use_ssl;   /* if AUTH TLS is to be attempted etc, for FTP or
+                             IMAP or POP3 or others! */
+diff -ur curl-7.48.0/src/tool_cfgable.h curl-7.48.0.mod/src/tool_cfgable.h
+--- curl-7.48.0/src/tool_cfgable.h	2016-03-22 07:15:38.000000000 +0000
++++ curl-7.48.0.mod/src/tool_cfgable.h	2016-04-27 18:21:08.616857787 +0100
+@@ -215,6 +215,7 @@
+   char *unix_socket_path;         /* path to Unix domain socket */
+   bool falsestart;
+   bool path_as_is;
++  bool sctp;                /* enables SCTP protocol (if avail in kernel) */
+   double expect100timeout;
+   struct GlobalConfig *global;
+   struct OperationConfig *prev;
+diff -ur curl-7.48.0/src/tool_getparam.c curl-7.48.0.mod/src/tool_getparam.c
+--- curl-7.48.0/src/tool_getparam.c	2016-03-22 07:15:38.000000000 +0000
++++ curl-7.48.0.mod/src/tool_getparam.c	2016-04-27 18:57:11.825902507 +0100
+@@ -263,6 +263,7 @@
+   {"s",  "silent",                   FALSE},
+   {"S",  "show-error",               FALSE},
+   {"t",  "telnet-options",           TRUE},
++  {"tp", "sctp",                     FALSE},
+          /* 'telnet-options' documented as telnet-option */
+   {"T",  "upload-file",              TRUE},
+   {"u",  "user",                     TRUE},
+@@ -1685,9 +1686,17 @@
+       break;
+     case 't':
+       /* Telnet options */
+-      err = add2list(&config->telnet_options, nextarg);
+-      if(err)
+-        return err;
++      switch(subletter) {
++      case 'p':
++         config->sctp = TRUE;
++         break;
++
++      default:
++         err = add2list(&config->telnet_options, nextarg);
++         if(err)
++            return err;
++         break;
++      }
+       break;
+     case 'T':
+       /* we are uploading */
+diff -ur curl-7.48.0/src/tool_operate.c curl-7.48.0.mod/src/tool_operate.c
+--- curl-7.48.0/src/tool_operate.c	2016-03-22 07:15:38.000000000 +0000
++++ curl-7.48.0.mod/src/tool_operate.c	2016-04-28 11:50:29.375634554 +0100
+@@ -337,6 +337,7 @@
+     }
+   }
+ 
++
+   /*
+   ** Nested loops start here.
+   */
+@@ -791,6 +792,9 @@
+         if(config->tcp_nodelay)
+           my_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
+ 
++        if(config->sctp)
++          my_setopt(curl, CURLOPT_ENABLE_SCTP, 1L);
++
+         /* where to store */
+         my_setopt(curl, CURLOPT_WRITEDATA, &outs);
+         if(metalink || !config->use_metalink)
