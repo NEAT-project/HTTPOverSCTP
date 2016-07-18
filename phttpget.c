@@ -37,7 +37,9 @@ __FBSDID("$FreeBSD: head/usr.sbin/portsnap/phttpget/phttpget.c 190679 2009-04-03
 #include <sys/time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#if defined(__FreeBSD__)
 #include <netinet/sctp.h>
+#endif
 
 #include <ctype.h>
 #include <err.h>
@@ -380,6 +382,8 @@ main(int argc, char *argv[])
 	off_t clen;			/* Chunk length */
 	int firstreq = 0;		/* # of first request for this connection */
 	int val;			/* Value used for setsockopt call */
+	int interactive = 0;	/* Read ressources by stdin */
+	char interactive_str[256];
 
 	/* Check that the arguments are sensible */
 	if (argc < 2)
@@ -387,6 +391,12 @@ main(int argc, char *argv[])
 
 	/* Read important environment variables */
 	readenv();
+
+	/* if we only have a servername - take ressources from stdin */
+	if (argc == 2) {
+		interactive = 1;
+		printf("interactive!\n");
+	}
 
 	/* Get server name and adjust arg[cv] to point at file names */
 	servername = argv[1];
@@ -420,8 +430,8 @@ main(int argc, char *argv[])
 		errx(1, "could not look up %s", servername);
 	res = res0;
 
-	/* Do the fetching */
-	while (nres < argc) {
+	/* Do the fetching - get res by arguments */
+	while (nres < argc || interactive) {
 		/* Make sure we have a connected socket */
 		for (; sd == -1; res = res->ai_next) {
 			/* No addresses left to try :-( */
@@ -485,11 +495,21 @@ main(int argc, char *argv[])
 		}
 
 		/* Construct requests and/or send them without blocking */
-		while ((nreq < argc) && ((reqbuf == NULL) || pipelined)) {
+		while ((nreq < argc || interactive) && ((reqbuf == NULL) || pipelined)) {
 			/* If not in the middle of a request, make one */
+			printf("buuuh\n");
 			if (reqbuf == NULL) {
-				reqbuflen = makerequest(&reqbuf, argv[nreq],
-				    servername, (nreq == argc - 1));
+				if (interactive) {
+					fgets(interactive_str, 256, stdin);
+					/* remove newline */
+					interactive_str[strcspn(interactive_str, "\r\n")] = 0;
+					reqbuflen = makerequest(&reqbuf, interactive_str,
+					    servername, 0);
+				} else {
+					reqbuflen = makerequest(&reqbuf, argv[nreq],
+					    servername, (nreq == argc - 1));
+				}
+				printf("--------\nrequest :\n%s\n-------\n", reqbuf);
 				reqbufpos = 0;
 			}
 
@@ -569,7 +589,7 @@ main(int argc, char *argv[])
 				 * tell us the length.
 				 */
 				if (hln[7] != '0')
-					pipelined = 1;
+					pipelined = 0;
 
 				/* Skip over the minor version number */
 				hln = strchr(hln + 7, ' ');
@@ -673,14 +693,19 @@ main(int argc, char *argv[])
 		 */
 		if (statuscode == 200) {
 			/* Generate a file name for the download */
-			fname = strrchr(argv[nres], '/');
-			if (fname == NULL)
-				fname = argv[nres];
-			else
-				fname++;
-			if (strlen(fname) == 0)
-				errx(1, "Cannot obtain file name from %s\n",
-				    argv[nres]);
+			if (interactive) {
+				asprintf(&fname, "felix");
+			} else {
+				fname = strrchr(argv[nres], '/');
+				if (fname == NULL)
+					fname = argv[nres];
+				else
+					fname++;
+				if (strlen(fname) == 0)
+					errx(1, "Cannot obtain file name from %s\n",
+					    argv[nres]);
+			}
+
 
 			fd = open(fname, O_CREAT | O_TRUNC | O_WRONLY, 0644);
 			if (fd == -1)
@@ -768,6 +793,8 @@ main(int argc, char *argv[])
 
 		/* We've finished this file! */
 		nres++;
+
+		printf("wanderpokal!\n");
 
 		/*
 		 * If necessary, clean up this connection so that we
