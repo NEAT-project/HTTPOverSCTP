@@ -585,11 +585,6 @@ main(int argc, char *argv[])
 
         do {
             /* Get a header line */
-            if (reqOpen < 1) {
-                printf("%d - nix offen, abbruch!\n", reqOpen);
-                break;
-            }
-
             error = readln(sd, resbuf, &resbuflen, &resbufpos);
             if (error)
                 goto conndied;
