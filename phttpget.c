@@ -214,7 +214,6 @@ readln(int sd, char * resbuf, int * resbuflen, int * resbufpos)
         msg.msg_control = cmsgbuf;
         msg.msg_controllen = sizeof(cmsgbuf);
         rcvinfo = (struct sctp_rcvinfo *)CMSG_DATA(cmsgbuf);
-        printf("recvmsg\n");
         len = recvmsg(sd, &msg, 0);
 
         reqOpen--;
@@ -272,9 +271,7 @@ copybytes(int sd, int fd, off_t copylen, char * resbuf, int * resbuflen,
         msg.msg_control = cmsgbuf;
         msg.msg_controllen = sizeof(cmsgbuf);
         rcvinfo = (struct sctp_rcvinfo *)CMSG_DATA(cmsgbuf);
-        printf("recvmsg a\n");
         len = recvmsg(sd, &msg, 0);
-        printf("recvmsg b\n");
         reqOpen--;
 
         if (protocol == IPPROTO_SCTP) {
@@ -341,6 +338,7 @@ main(int argc, char *argv[])
     char* cmsgbuf[CMSG_SPACE(sizeof(struct sctp_sndinfo))];
     struct sctp_initmsg initmsg;
     int tempindex = 0;
+    uint8_t streamsFull = 0;
 
     /* initialize */
     memset(cmsgbuf, 0, CMSG_SPACE(sizeof(struct sctp_sndinfo)));
@@ -480,6 +478,7 @@ main(int argc, char *argv[])
 
             /* If in pipelined mode, try to send the request */
             if (pipelined) {
+                streamsFull = 0;
                 while (reqbufpos < reqbuflen) {
                     memset(&msghdr, 0, sizeof(struct msghdr));
                     memset(&iov, 0, sizeof(struct iovec));
@@ -502,13 +501,12 @@ main(int argc, char *argv[])
 
                         sndinfo = (struct sctp_sndinfo*) CMSG_DATA(cmsg);
                         if (getnextstream(sndinfo) == -1) {
-                            fprintf(stderr, "problem : getnextstream a\n");
+                            streamsFull = 1;
                             break;
                         }
                     }
 
                     len = sendmsg(sd, &msghdr, 0);
-                    printf("sendmsg\n");
                     reqOpen++;
                     //len = send(sd, reqbuf + reqbufpos, reqbuflen - reqbufpos, 0);
                     if (len == -1) {
@@ -518,8 +516,9 @@ main(int argc, char *argv[])
                     reqbufpos += len;
                 }
                 if (reqbufpos < reqbuflen) {
-                    if (errno != EAGAIN)
+                    if (errno != EAGAIN && streamsFull == 0) {
                         goto conndied;
+                    }
                     break;
                 } else {
                     free(reqbuf);
@@ -559,14 +558,11 @@ main(int argc, char *argv[])
 
                     sndinfo = (struct sctp_sndinfo*) CMSG_DATA(cmsg);
                     if (getnextstream(sndinfo) == -1) {
-                        fprintf(stderr, "problem : getnextstream b\n");
                         break;
                     }
                 }
 
                 len = sendmsg(sd, &msghdr, 0);
-                printf("sendmsg\n");
-                reqOpen++;
                 //len = send(sd, reqbuf + reqbufpos, reqbuflen - reqbufpos, 0);
                 if (len == -1)
                     goto conndied;
@@ -585,6 +581,7 @@ main(int argc, char *argv[])
 
         do {
             /* Get a header line */
+
             error = readln(sd, resbuf, &resbuflen, &resbufpos);
             if (error)
                 goto conndied;
@@ -839,6 +836,7 @@ conndied:
          * close this connection, open a new one, and reissue the
          * request.
          */
+        printf("conndied?!?!?!?!?\n");
         if (nres == firstreq)
             errx(1, "Connection failure");
 
@@ -846,6 +844,7 @@ cleanupconn:
         /*
          * Clean up our connection and keep on going
          */
+        printf("cleanupconn?!?!?!?!?\n");
         shutdown(sd, SHUT_RDWR);
         close(sd);
         sd = -1;
