@@ -67,7 +67,6 @@ static uint8_t          streamstatus[NUM_SCTP_STREAMS];
 static uint32_t         lastStream = 0;
 static uint32_t         reqOpen = 0;
 
-
 enum stream_status {
     STREAM_FREE,
     STREAM_USED
@@ -298,50 +297,81 @@ copybytes(int sd, int fd, off_t copylen, char * resbuf, int * resbuflen,
 }
 
 int
-main(int argc, char *argv[])
-{
-    struct addrinfo hints;        /* Hints to getaddrinfo */
-    struct addrinfo *res;        /* Pointer to server address being used */
-    struct addrinfo *res0;        /* Pointer to server addresses */
-#ifdef SCTP_REMOTE_UDP_ENCAPS_PORT
-    struct sctp_udpencaps encaps;    /* SCTP/UDP information */
-#endif
-    char * resbuf = NULL;        /* Response buffer */
-    int resbufpos = 0;        /* Response buffer position */
-    int resbuflen = 0;        /* Response buffer length */
-    char * eolp;            /* Pointer to "\r\n" within resbuf */
-    char * hln;            /* Pointer within header line */
-    char * servername;        /* Name of server */
-    char * fname = NULL;        /* Name of downloaded file */
-    char * reqbuf = NULL;        /* Request buffer */
-    int reqbufpos = 0;        /* Request buffer position */
-    int reqbuflen = 0;        /* Request buffer length */
-    ssize_t len;            /* Length sent or received */
-    int nreq = 0;            /* Number of next request to send */
-    int nres = 0;            /* Number of next reply to receive */
-    int pipelined = 0;        /* != 0 if connection in pipelined mode. */
-    int keepalive;            /* != 0 if HTTP/1.0 keep-alive rcvd. */
-    int sd = -1;            /* Socket descriptor */
-    int sdflags = 0;        /* Flags on the socket sd */
-    int fd = -1;            /* Descriptor for download target file */
-    int error;            /* Error code */
-    int statuscode;            /* HTTP Status code */
-    off_t contentlength;        /* Value from Content-Length header */
-    int chunked;            /* != if transfer-encoding is chunked */
-    off_t clen;            /* Chunk length */
-    int firstreq = 0;        /* # of first request for this connection */
-    int val;            /* Value used for setsockopt call */
+send_request(int sd,  char *buffer, int buflen) {
+    char* cmsgbuf[CMSG_SPACE(sizeof(struct sctp_sndinfo))];
     struct iovec iov;
     struct msghdr msghdr;
     struct sctp_sndinfo *sndinfo;
     struct cmsghdr *cmsg;
-    char* cmsgbuf[CMSG_SPACE(sizeof(struct sctp_sndinfo))];
-    struct sctp_initmsg initmsg;
-    int tempindex = 0;
-    uint8_t streamsFull = 0;
 
     /* initialize */
     memset(cmsgbuf, 0, CMSG_SPACE(sizeof(struct sctp_sndinfo)));
+    memset(&msghdr, 0, sizeof(struct msghdr));
+    memset(&iov, 0, sizeof(struct iovec));
+
+    msghdr.msg_iov = &iov;
+    msghdr.msg_iovlen = 1;
+
+    iov.iov_base = buffer; //reqbuf + reqbufpos;
+    iov.iov_len = buflen; //reqbuflen - reqbufpos;
+
+    if (protocol == IPPROTO_SCTP) {
+        msghdr.msg_control = cmsgbuf;
+        msghdr.msg_controllen = CMSG_SPACE(sizeof(struct sctp_sndinfo));
+
+        cmsg = CMSG_FIRSTHDR(&msghdr);
+        cmsg->cmsg_level = IPPROTO_SCTP;
+        cmsg->cmsg_type = SCTP_SNDINFO;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(struct sctp_sndinfo));
+
+        sndinfo = (struct sctp_sndinfo*) CMSG_DATA(cmsg);
+        if (getnextstream(sndinfo) == -1) {
+            return -2;
+        }
+    }
+
+    return sendmsg(sd, &msghdr, 0);
+}
+
+
+int
+main(int argc, char *argv[])
+{
+    struct addrinfo hints;          /* Hints to getaddrinfo */
+    struct addrinfo *res;           /* Pointer to server address being used */
+    struct addrinfo *res0;          /* Pointer to server addresses */
+#ifdef SCTP_REMOTE_UDP_ENCAPS_PORT
+    struct sctp_udpencaps encaps;   /* SCTP/UDP information */
+#endif
+    char * resbuf = NULL;       /* Response buffer */
+    int resbufpos = 0;          /* Response buffer position */
+    int resbuflen = 0;          /* Response buffer length */
+    char * eolp;                /* Pointer to "\r\n" within resbuf */
+    char * hln;                 /* Pointer within header line */
+    char * servername;          /* Name of server */
+    char * fname = NULL;        /* Name of downloaded file */
+    char * reqbuf = NULL;       /* Request buffer */
+    int reqbufpos = 0;          /* Request buffer position */
+    int reqbuflen = 0;          /* Request buffer length */
+    ssize_t len;                /* Length sent or received */
+    int nreq = 0;               /* Number of next request to send */
+    int nres = 0;               /* Number of next reply to receive */
+    int pipelined = 0;          /* != 0 if connection in pipelined mode. */
+    int keepalive;              /* != 0 if HTTP/1.0 keep-alive rcvd. */
+    int sd = -1;                /* Socket descriptor */
+    int sdflags = 0;            /* Flags on the socket sd */
+    int fd = -1;                /* Descriptor for download target file */
+    int error;                  /* Error code */
+    int statuscode;             /* HTTP Status code */
+    off_t contentlength;        /* Value from Content-Length header */
+    int chunked;                /* != if transfer-encoding is chunked */
+    off_t clen;                 /* Chunk length */
+    int firstreq = 0;           /* # of first request for this connection */
+    int val;                    /* Value used for setsockopt call */
+    struct sctp_initmsg initmsg;
+    int tempindex = 0;
+    uint8_t streamsbusy = 0;
+
     for (tempindex = 0; tempindex < NUM_SCTP_STREAMS; tempindex++) {
         streamstatus[tempindex] = STREAM_FREE;
     }
@@ -478,45 +508,23 @@ main(int argc, char *argv[])
 
             /* If in pipelined mode, try to send the request */
             if (pipelined) {
-                streamsFull = 0;
+                streamsbusy = 0;
                 while (reqbufpos < reqbuflen) {
-                    memset(&msghdr, 0, sizeof(struct msghdr));
-                    memset(&iov, 0, sizeof(struct iovec));
-
-                    msghdr.msg_namelen = res->ai_addrlen;
-                    msghdr.msg_iov = &iov;
-                    msghdr.msg_iovlen = 1;
-
-                    iov.iov_base = reqbuf + reqbufpos;
-                    iov.iov_len = reqbuflen - reqbufpos;
-
-                    if (protocol == IPPROTO_SCTP) {
-                        msghdr.msg_control = cmsgbuf;
-                        msghdr.msg_controllen = CMSG_SPACE(sizeof(struct sctp_sndinfo));
-
-                        cmsg = CMSG_FIRSTHDR(&msghdr);
-                        cmsg->cmsg_level = IPPROTO_SCTP;
-                        cmsg->cmsg_type = SCTP_SNDINFO;
-                        cmsg->cmsg_len = CMSG_LEN(sizeof(struct sctp_sndinfo));
-
-                        sndinfo = (struct sctp_sndinfo*) CMSG_DATA(cmsg);
-                        if (getnextstream(sndinfo) == -1) {
-                            streamsFull = 1;
-                            break;
-                        }
-                    }
-
-                    len = sendmsg(sd, &msghdr, 0);
+                    len = send_request(sd, reqbuf + reqbufpos, reqbuflen - reqbufpos);
                     reqOpen++;
                     //len = send(sd, reqbuf + reqbufpos, reqbuflen - reqbufpos, 0);
                     if (len == -1) {
-                        break;
                         fprintf(stderr, "problem : len == -1\n");
+                        break;
+                    } else if (len == -2) {
+                        streamsbusy = 1;
+                        fprintf(stderr, "problem : len == -2 - all streams are busy...\n");
+                        break;
                     }
                     reqbufpos += len;
                 }
                 if (reqbufpos < reqbuflen) {
-                    if (errno != EAGAIN && streamsFull == 0) {
+                    if (errno != EAGAIN && streamsbusy == 0) {
                         goto conndied;
                     }
                     break;
@@ -537,35 +545,16 @@ main(int argc, char *argv[])
         /* Do we need to blocking-send a request? */
         if (nres == nreq) {
             while (reqbufpos < reqbuflen) {
-                memset(&msghdr, 0, sizeof(struct msghdr));
-                memset(&iov, 0, sizeof(struct iovec));
-
-                msghdr.msg_namelen = res->ai_addrlen;
-                msghdr.msg_iov = &iov;
-                msghdr.msg_iovlen = 1;
-
-                iov.iov_base = reqbuf + reqbufpos;
-                iov.iov_len = reqbuflen - reqbufpos;
-
-                if (protocol == IPPROTO_SCTP) {
-                    msghdr.msg_control = cmsgbuf;
-                    msghdr.msg_controllen = CMSG_SPACE(sizeof(struct sctp_sndinfo));
-
-                    cmsg = CMSG_FIRSTHDR(&msghdr);
-                    cmsg->cmsg_level = IPPROTO_SCTP;
-                    cmsg->cmsg_type = SCTP_SNDINFO;
-                    cmsg->cmsg_len = CMSG_LEN(sizeof(struct sctp_sndinfo));
-
-                    sndinfo = (struct sctp_sndinfo*) CMSG_DATA(cmsg);
-                    if (getnextstream(sndinfo) == -1) {
-                        break;
-                    }
-                }
-
-                len = sendmsg(sd, &msghdr, 0);
+                len = send_request(sd, reqbuf + reqbufpos, reqbuflen - reqbufpos);
+                reqOpen++;
                 //len = send(sd, reqbuf + reqbufpos, reqbuflen - reqbufpos, 0);
-                if (len == -1)
+                if (len == -1) {
+                    fprintf(stderr, "problem : len == -1\n");
                     goto conndied;
+                } else if (len == -2) {
+                    streamsbusy = 1;
+                    fprintf(stderr, "problem : len == -2 - all streams are busy...\n");
+                }
                 reqbufpos += len;
             }
             free(reqbuf);
