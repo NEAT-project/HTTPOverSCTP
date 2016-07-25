@@ -66,9 +66,9 @@ static struct           timeval timo = {15, 0};
 static in_port_t        udp_encaps_port = 0;
 static int              protocol = IPPROTO_TCP;
 static uint8_t          streamstatus[NUM_SCTP_STREAMS];
-static uint32_t         lastStream = 0;                     /* last SCTP stream read from */
-static char             *servername;                        /* Name of server */
-static uint8_t          streamsbusy = 0;                    /* all streams are busy ... */
+static uint32_t         lastStream = 0;                     /* Last SCTP stream read from */
+static char             *servername;                        /* Name of server to connect with */
+static uint8_t          streamsbusy = 0;                    /* Indicator if all streams are busy */
 
 enum stream_status {STREAM_FREE, STREAM_USED};
 
@@ -108,7 +108,7 @@ strnstr(const char *s, const char *find, size_t slen)
 static void
 usage(void)
 {
-    fprintf(stderr, "usage: phttpget server [file ...]\n");
+    fprintf(stderr, "usage: phttpget server [file1 file2 filnen]\n");
     exit(EX_USAGE);
 }
 
@@ -194,7 +194,7 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
 
         /* If the buffer is full, complain */
         if (*resbuflen == BUFSIZ) {
-            fprintf(stderr, "buffer is full\n");
+            fprintf(stderr, "readln - buffer is full\n");
             return -1;
         }
 
@@ -210,15 +210,15 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
         rcvinfo = (struct sctp_rcvinfo *)CMSG_DATA(cmsgbuf);
         len = recvmsg(sd, &msg, 0);
 
+        // remember stream
         if (protocol == IPPROTO_SCTP) {
             lastStream = rcvinfo->rcv_sid;
         }
 
+        //
         if ((len == 0) || ((len == -1) && (errno != EINTR))) {
             return -1;
-        }
-
-        if (len != -1) {
+        } else if (len != -1) {
             *resbuflen += len;
         }
     }
@@ -245,10 +245,12 @@ copybytes(int sd, int fd, off_t copylen, char * resbuf, int * resbuflen,
         if (copylen < len)
             len = copylen;
         if (len > 0) {
-            if (fd != -1)
+            if (fd != -1) {
                 len = write(fd, resbuf + *resbufpos, len);
-            if (len == -1)
+            }
+            if (len == -1) {
                 err(1, "write");
+            }
             *resbufpos += len;
             copylen -= len;
             continue;
@@ -265,6 +267,7 @@ copybytes(int sd, int fd, off_t copylen, char * resbuf, int * resbuflen,
         rcvinfo = (struct sctp_rcvinfo *)CMSG_DATA(cmsgbuf);
         len = recvmsg(sd, &msg, 0);
 
+        // felix xxx - check!!
         if (protocol == IPPROTO_SCTP) {
             lastStream = rcvinfo->rcv_sid;
         }
@@ -296,17 +299,15 @@ send_request(int sd,  char *reqbuf, int *reqbuflen, int *reqbufpos) {
     struct cmsghdr *cmsg;
     int len;
 
-
     /* initialize */
     memset(cmsgbuf, 0, CMSG_SPACE(sizeof(struct sctp_sndinfo)));
     memset(&msghdr, 0, sizeof(struct msghdr));
     memset(&iov, 0, sizeof(struct iovec));
-    streamsbusy = 0;
 
     msghdr.msg_iov = &iov;
     msghdr.msg_iovlen = 1;
 
-    /* if using SCTP, append control msg */
+    /* if using SCTP, append control msg to define outgoing stream */
     if (protocol == IPPROTO_SCTP) {
         msghdr.msg_control = cmsgbuf;
         msghdr.msg_controllen = CMSG_SPACE(sizeof(struct sctp_sndinfo));
@@ -355,12 +356,12 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
     char * fname = NULL;        /* Name of downloaded file */
     struct request *request;    /* request from queue */
 
-
     statuscode = 0;
     contentlength = -1;
     chunked = 0;
     *keepalive = 0;
 
+    /* take head element from pending queue */
     if ((request = TAILQ_FIRST(&requests_pending)) == NULL) {
         fprintf(stderr, "%s - this should not happen\n", __func__);
         exit(-1);
@@ -369,7 +370,7 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
     do {
         /* Get a header line */
         if (readln(*sd, resbuf, resbuflen, resbufpos)) {
-            fprintf(stderr, "handle_response - readline error\n");
+            fprintf(stderr, "handle_response - readln failed\n");
             return -1;
         }
 
@@ -412,8 +413,7 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
 
             /* Read the status code */
             while (isdigit(*hln)) {
-                statuscode = statuscode * 10 +
-                    *hln - '0';
+                statuscode = statuscode * 10 + *hln - '0';
                 hln++;
             }
 
@@ -425,10 +425,7 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
             continue;
         }
 
-        /*
-         * Check for "Connection: close" or
-         * "Connection: Keep-Alive" header
-         */
+        /* Check for "Connection: close" or "Connection: Keep-Alive" header */
         if (strncasecmp(hln, "Connection:", 11) == 0) {
             hln += 11;
             if (strcasestr(hln, "close") != NULL) {
@@ -449,8 +446,9 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
             contentlength = 0;
 
             /* Find the start of the length */
-            while (!isdigit(*hln) && (*hln != '\0'))
+            while (!isdigit(*hln) && (*hln != '\0')) {
                 hln++;
+            }
 
             /* Compute the length */
             while (isdigit(*hln)) {
@@ -520,6 +518,7 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
             errx(1, "Cannot obtain file name from %s\n", request->url);
         }
 
+        /* Open file for writing */
         *fd = open(fname, O_CREAT | O_TRUNC | O_WRONLY, 0644);
         if (*fd == -1) {
             errx(1, "open(%s)", fname);
@@ -640,20 +639,21 @@ main(int argc, char *argv[])
     int i = 0;                      /* For loop iterator */
     int firstreq = 0;               /* # of first request for this connection */
     int val;                        /* Value used for setsockopt call */
-    struct sctp_initmsg initmsg;
-    int tempindex = 0;
+    struct sctp_initmsg initmsg;    /* To signal die number of incoming and outgoing streams */
+    int tempindex = 0;              /* Variable for loops */
     char *resbuf = NULL;            /* Response buffer */
-    int resbuflen = 0;
-    int keepalive = 0;
-    int fd = 0;
-    struct request *request;
+    int resbuflen = 0;              /* Length of the receiver buffer */
+    int keepalive = 0;              /* Keep-Alive indicator */
+    int fd = 0;                     /* Filedescriptor (file) */
+    struct request *request;        /* Request from open or pending queue */
     int resbufpos = 0;              /* Response buffer position */
-    int              num_req_open = 0;
-    int              num_req_pending = 0;
+    int num_req_open = 0;
+    int num_req_pending = 0;
 
     TAILQ_INIT(&requests_open);
     TAILQ_INIT(&requests_pending);
 
+    /* Initialize the stream status array */
     for (tempindex = 0; tempindex < NUM_SCTP_STREAMS; tempindex++) {
         streamstatus[tempindex] = STREAM_FREE;
     }
@@ -724,6 +724,7 @@ main(int argc, char *argv[])
             /* Create a socket... */
             sd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
             if (sd == -1) {
+                /* reatry... */
                 continue;
             }
 
