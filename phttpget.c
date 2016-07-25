@@ -53,6 +53,7 @@ __FBSDID("$FreeBSD: head/usr.sbin/portsnap/phttpget/phttpget.c 190679 2009-04-03
 #include <unistd.h>
 #include <sys/queue.h>
 
+/* maximum SCTP streams */
 #define NUM_SCTP_STREAMS    10
 
 static const char *     env_HTTP_USER_AGENT;
@@ -60,17 +61,16 @@ static char *           env_HTTP_TIMEOUT;
 static char *           env_HTTP_TRANSPORT_PROTOCOL;
 static char *           env_HTTP_SCTP_UDP_ENCAPS_PORT;
 
-static struct           timeval timo = { 15, 0};
+static struct           timeval timo = {15, 0};
 
 static in_port_t        udp_encaps_port = 0;
 static int              protocol = IPPROTO_TCP;
 static uint8_t          streamstatus[NUM_SCTP_STREAMS];
-static uint32_t         lastStream = 0;
-static char             *servername;              /* Name of server */
-static uint8_t                 streamsbusy = 0;
-static int                     num_req_open = 0;
-static int                     num_req_pending = 0;
+static uint32_t         lastStream = 0;                     /* last SCTP stream read from */
+static char             *servername;                        /* Name of server */
+static uint8_t          streamsbusy = 0;                    /* all streams are busy ... */
 
+enum stream_status {STREAM_FREE, STREAM_USED};
 
 struct request {
     char *url;
@@ -81,11 +81,6 @@ TAILQ_HEAD(request_queue, request);
 
 struct request_queue requests_open;
 struct request_queue requests_pending;
-
-enum stream_status {
-    STREAM_FREE,
-    STREAM_USED
-};
 
 #ifndef __FreeBSD__
 char *
@@ -143,44 +138,43 @@ readenv(void)
     long port;
 
     env_HTTP_USER_AGENT = getenv("HTTP_USER_AGENT");
-    if (env_HTTP_USER_AGENT == NULL)
+    if (env_HTTP_USER_AGENT == NULL) {
         env_HTTP_USER_AGENT = "phttpget/0.1";
+    }
 
     env_HTTP_TIMEOUT = getenv("HTTP_TIMEOUT");
     if (env_HTTP_TIMEOUT != NULL) {
         http_timeout = strtol(env_HTTP_TIMEOUT, &p, 10);
-        if ((*env_HTTP_TIMEOUT == '\0') || (*p != '\0') ||
-            (http_timeout < 0))
-            warnx("HTTP_TIMEOUT (%s) is not a positive integer",
-                env_HTTP_TIMEOUT);
-        else
+        if ((*env_HTTP_TIMEOUT == '\0') || (*p != '\0') || (http_timeout < 0)) {
+            warnx("HTTP_TIMEOUT (%s) is not a positive integer", env_HTTP_TIMEOUT);
+        } else {
             timo.tv_sec = http_timeout;
+        }
     }
     env_HTTP_TRANSPORT_PROTOCOL = getenv("HTTP_TRANSPORT_PROTOCOL");
     if (env_HTTP_TRANSPORT_PROTOCOL != NULL) {
-        if (strncasecmp(env_HTTP_TRANSPORT_PROTOCOL, "TCP", 3) == 0)
+        if (strncasecmp(env_HTTP_TRANSPORT_PROTOCOL, "TCP", 3) == 0) {
             protocol = IPPROTO_TCP;
-        else if (strncasecmp(env_HTTP_TRANSPORT_PROTOCOL, "SCTP", 4) == 0)
+        } else if (strncasecmp(env_HTTP_TRANSPORT_PROTOCOL, "SCTP", 4) == 0) {
             protocol = IPPROTO_SCTP;
-        else
-            warnx("HTTP_TRANSPORT_PROTOCOL (%s) not supported",
-                env_HTTP_TRANSPORT_PROTOCOL);
+        } else {
+            warnx("HTTP_TRANSPORT_PROTOCOL (%s) not supported", env_HTTP_TRANSPORT_PROTOCOL);
+        }
     }
 
     env_HTTP_SCTP_UDP_ENCAPS_PORT = getenv("HTTP_SCTP_UDP_ENCAPS_PORT");
     if (env_HTTP_SCTP_UDP_ENCAPS_PORT != NULL) {
         port = strtol(env_HTTP_SCTP_UDP_ENCAPS_PORT, &p, 10);
-        if ((*env_HTTP_SCTP_UDP_ENCAPS_PORT == '\0') || (*p != '\0') ||
-            (port < 0) || (port > 65535))
-            warnx("HTTP_SCTP_UDP_ENCAPS_PORT (%s) is not a valid port number",
-                env_HTTP_SCTP_UDP_ENCAPS_PORT);
-        else
+        if ((*env_HTTP_SCTP_UDP_ENCAPS_PORT == '\0') || (*p != '\0') || (port < 0) || (port > 65535)) {
+            warnx("HTTP_SCTP_UDP_ENCAPS_PORT (%s) is not a valid port number", env_HTTP_SCTP_UDP_ENCAPS_PORT);
+        } else {
             udp_encaps_port = (in_port_t)port;
+        }
     }
 }
 
 static int
-readln(int sd, char * resbuf, int * resbuflen, int * resbufpos)
+readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
 {
     ssize_t len;
     struct msghdr msg;
@@ -338,8 +332,7 @@ send_request(int sd,  char *reqbuf, int *reqbuflen, int *reqbufpos) {
         iov.iov_len = *reqbuflen - *reqbufpos;
 
         if ((len = sendmsg(sd, &msghdr, 0)) < 0) {
-            fprintf(stderr, "problem : send_request failed - sendmsg failed...");
-            exit(-1);
+            break;
         }
 
         /* move reqbufpos by sent bytes */
@@ -621,12 +614,7 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
     else
         fprintf(stderr, "Error (ignored)\n");
 
-    /* We've finished this file! */
-    (*nres)++;
-    num_req_pending--;
-
     return 0;
-
 }
 
 
@@ -659,8 +647,9 @@ main(int argc, char *argv[])
     int keepalive = 0;
     int fd = 0;
     struct request *request;
-    int limit = 100;
     int resbufpos = 0;              /* Response buffer position */
+    int              num_req_open = 0;
+    int              num_req_pending = 0;
 
     TAILQ_INIT(&requests_open);
     TAILQ_INIT(&requests_pending);
@@ -724,13 +713,6 @@ main(int argc, char *argv[])
 
     /* Do the fetching */
     while (num_req_open > 0 || num_req_pending > 0) {
-
-        //printf("loop - req_open : %d - req_pending : %d\n", num_req_open, num_req_pending);
-
-        if (limit++ > 200) {
-            printf("exit by limit\n");
-            exit(-1);
-        }
 
         /* Make sure we have a connected socket */
         for (; sd == -1; res = res->ai_next) {
@@ -836,7 +818,7 @@ main(int argc, char *argv[])
             }
 
             /* If in pipelined mode, try to send the request */
-            if (pipelined) {
+            if (pipelined && streamsbusy == 0) {
                 if (send_request(sd, reqbuf, &reqbuflen, &reqbufpos) == -1) {
                     fprintf(stderr, "send_request failed\n");
                     goto conndied; //handle more precisely...
@@ -877,7 +859,7 @@ main(int argc, char *argv[])
         }
 
         /* sending last request ... do we need to blocking-send a request? */
-        if (nreq == nres) {
+        if (nreq == nres && streamsbusy == 0) {
             if (send_request(sd, reqbuf, &reqbuflen, &reqbufpos) == -1) {
                 fprintf(stderr, "send_request failed\n");
                 goto conndied; //handle more precisely...
@@ -914,6 +896,14 @@ main(int argc, char *argv[])
             request = TAILQ_FIRST(&requests_pending);
             TAILQ_REMOVE(&requests_pending, request, entries);
             free(request);
+
+            /* We've finished this file! */
+            nres++;
+            num_req_pending--;
+
+            /* at least one stream is free for a new request */
+            streamsbusy = 0;
+
             continue;
         }
 
