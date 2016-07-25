@@ -82,6 +82,9 @@ TAILQ_HEAD(request_queue, request);
 struct request_queue requests_open;
 struct request_queue requests_pending;
 
+#define MAX(a,b) (((a)>(b))?(a):(b))
+
+
 #ifndef __FreeBSD__
 char *
 strnstr(const char *s, const char *find, size_t slen)
@@ -171,6 +174,8 @@ readenv(void)
             udp_encaps_port = (in_port_t)port;
         }
     }
+
+    printf("BUFSIZ : %d\n", BUFSIZ);
 }
 
 static int
@@ -649,6 +654,11 @@ main(int argc, char *argv[])
     int resbufpos = 0;              /* Response buffer position */
     int num_req_open = 0;
     int num_req_pending = 0;
+    struct fd_set fdsetrecv;
+    struct fd_set fdsetsend;
+    int interactive = 0;
+    int maxfd = 0;
+    int selectsock = -1;
 
     TAILQ_INIT(&requests_open);
     TAILQ_INIT(&requests_pending);
@@ -670,6 +680,12 @@ main(int argc, char *argv[])
     servername = argv[1];
     argv += 2;
     argc -= 2;
+
+
+    if (argc < 1) {
+        printf("switching to interactive mode\n");
+        interactive = 1;
+    }
 
     /* Parse requests by cmdline arguments and queue them */
     for (i = 0; i < argc; i++) {
@@ -712,7 +728,7 @@ main(int argc, char *argv[])
     res = res0;
 
     /* Do the fetching */
-    while (num_req_open > 0 || num_req_pending > 0) {
+    while (num_req_open > 0 || num_req_pending > 0 || interactive) {
 
         /* Make sure we have a connected socket */
         for (; sd == -1; res = res->ai_next) {
@@ -782,6 +798,64 @@ main(int argc, char *argv[])
             firstreq = nres;
         }
 
+        /* Initialize select structs */
+        FD_ZERO(&fdsetrecv);
+        FD_ZERO(&fdsetsend);
+
+        /* Hook stdin in select */
+        if (interactive) {
+            FD_SET(STDIN_FILENO, &fdsetrecv);
+        }
+
+        /* Bind sd to select functions */
+        if (num_req_open > 0) {
+            FD_SET(sd, &fdsetsend);
+        }
+        FD_SET(sd, &fdsetrecv);
+
+        maxfd = MAX(STDIN_FILENO, sd) + 1;
+
+        /* Select section - handle stdin and socket */
+        fprintf(stderr, "before select\n");
+        if ((selectsock = select(maxfd, &fdsetrecv, &fdsetsend, NULL, NULL)) < 0) {
+			perror("select");
+			exit(EXIT_FAILURE);
+        }
+        fprintf(stderr, "after select\n");
+
+        if (FD_ISSET(STDIN_FILENO, &fdsetrecv)) {
+            printf("stdin - recv\n");
+
+            if ((request = malloc(sizeof(struct request))) == NULL) {
+                perror("malloc failed");
+                exit(EXIT_FAILURE);
+            }
+
+            if ((request->url = malloc(BUFSIZ)) == NULL) {
+                perror("malloc failed");
+                exit(EXIT_FAILURE);
+            }
+
+            if (fgets(request->url, BUFSIZ, stdin) == NULL) {
+                perror("fgets failed");
+                exit(EXIT_FAILURE);
+            }
+
+            request->url[strcspn(request->url, "\n")] = 0;
+
+            printf("queueing : %s\n", request->url);
+            TAILQ_INSERT_TAIL(&requests_open, request, entries);
+            num_req_open++;
+        } else if (FD_ISSET(STDIN_FILENO, &fdsetrecv)) {
+            printf("stdin - send\n");
+        } else if (FD_ISSET(sd, &fdsetrecv)) {
+            printf("sd - recv\n");
+        } else if (FD_ISSET(sd, &fdsetsend)) {
+            printf("sd - send\n");
+        } else {
+            printf("somehting else\n");
+        }
+
         /*
          * If in pipelined HTTP mode, put socket into non-blocking
          * mode, since we're probably going to want to try to send
@@ -838,7 +912,7 @@ main(int argc, char *argv[])
 
                     /* move queue element from open to pending */
                     if ((request = TAILQ_FIRST(&requests_open)) == NULL) {
-                        fprintf(stderr, "%s - this should not happen...\n", __func__);
+                        fprintf(stderr, "[%d][%s] - this should not happen...\n", __LINE__, __func__);
                         exit(-1);
                     }
                     TAILQ_REMOVE(&requests_open, request, entries);
@@ -855,8 +929,9 @@ main(int argc, char *argv[])
 
         /* Put connection back into blocking mode */
         if (pipelined) {
-            if (fcntl(sd, F_SETFL, sdflags) == -1)
+            if (fcntl(sd, F_SETFL, sdflags) == -1) {
                 err(1, "fcntl");
+            }
         }
 
         /* sending last request ... do we need to blocking-send a request? */
