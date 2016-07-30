@@ -189,6 +189,8 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
 
     memset(cmsgbuf, 0, CMSG_SPACE(sizeof(struct sctp_rcvinfo)));
 
+
+
     while (strnstr(resbuf + *resbufpos, "\r\n", *resbuflen - *resbufpos) == NULL) {
         /* Move buffered data to the start of the buffer */
         if (*resbufpos != 0) {
@@ -199,7 +201,7 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
 
         /* If the buffer is full, complain */
         if (*resbuflen == BUFSIZ) {
-            fprintf(stderr, "readln - buffer is full\n");
+            fprintf(stderr, "[%d][%s] - buffer is full\n", __LINE__, __func__);
             return -1;
         }
 
@@ -222,12 +224,12 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
 
         //
         if ((len == 0) || ((len == -1) && (errno != EINTR))) {
+            fprintf(stderr, "[%d][%s] - recvmsg returned 0 or -1\n", __LINE__, __func__);
             return -1;
         } else if (len != -1) {
             *resbuflen += len;
         }
     }
-
     return 0;
 }
 
@@ -254,7 +256,8 @@ copybytes(int sd, int fd, off_t copylen, char * resbuf, int * resbuflen,
                 len = write(fd, resbuf + *resbufpos, len);
             }
             if (len == -1) {
-                err(1, "write");
+                fprintf(stderr, "[%d][%s] - write() failed\n", __LINE__, __func__);
+                exit(EXIT_FAILURE);
             }
             *resbufpos += len;
             copylen -= len;
@@ -283,6 +286,7 @@ copybytes(int sd, int fd, off_t copylen, char * resbuf, int * resbuflen,
             if (errno == EINTR) {
                 continue;
             }
+            fprintf(stderr, "[%d][%s] - recvmsg() failed\n", __LINE__, __func__);
             return -1;
         } else if (len == 0) {
             return -2;
@@ -327,7 +331,7 @@ send_request(int sd,  char *reqbuf, int *reqbuflen, int *reqbufpos) {
         /* lookup next free stream - if all streams busy return with -2 */
         if (getnextstream(sndinfo) == -1) {
             streamsbusy = 1;
-            fprintf(stderr, "problem : send_request failed - streams are busy...");
+            fprintf(stderr, "[%d][%s] - all SCTP streams are busy...\n", __LINE__, __func__);
             return -2;
         }
     }
@@ -338,6 +342,7 @@ send_request(int sd,  char *reqbuf, int *reqbuflen, int *reqbufpos) {
         iov.iov_len = *reqbuflen - *reqbufpos;
 
         if ((len = sendmsg(sd, &msghdr, 0)) < 0) {
+            fprintf(stderr, "[%d][%s] - sendmsg() failed...\n", __LINE__, __func__);
             break;
         }
 
@@ -349,7 +354,7 @@ send_request(int sd,  char *reqbuf, int *reqbuflen, int *reqbufpos) {
 }
 
 static int
-handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, int *nres, int *keepalive, int *pipelined)
+handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, int *nres, struct request *request, int *keepalive, int *pipelined)
 {
     int error = 0;
     char * hln;                 /* Pointer within header line */
@@ -359,23 +364,17 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
     int chunked;                /* != if transfer-encoding is chunked */
     off_t clen;                 /* Chunk length */
     char * fname = NULL;        /* Name of downloaded file */
-    struct request *request;    /* request from queue */
 
     statuscode = 0;
     contentlength = -1;
     chunked = 0;
     *keepalive = 0;
 
-    /* take head element from pending queue */
-    if ((request = TAILQ_FIRST(&requests_pending)) == NULL) {
-        fprintf(stderr, "%s - this should not happen\n", __func__);
-        exit(-1);
-    }
 
     do {
         /* Get a header line */
         if (readln(*sd, resbuf, resbuflen, resbufpos)) {
-            fprintf(stderr, "handle_response - readln failed\n");
+            fprintf(stderr, "[%d][%s] - readln() failed\n", __LINE__, __func__);
             return -1;
         }
 
@@ -440,6 +439,8 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
             if (strcasestr(hln, "Keep-Alive") != NULL) {
                 *keepalive = 1;
             }
+
+            fprintf(stderr, "keep-alive : %d - pipelined: %d\n", *keepalive, *pipelined);
 
             /* Next header... */
             continue;
@@ -570,8 +571,9 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
         /* Read trailer and final CRLF */
         do {
             error = readln(*sd, resbuf, resbuflen, resbufpos);
-            if (error)
+            if (error) {
                 return -1;
+            }
             hln = resbuf + *resbufpos;
             eolp = strstr(hln, "\r\n");
             *resbufpos = (eolp - resbuf) + 2;
@@ -579,7 +581,7 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
     } else if (contentlength != -1) {
         error = copybytes(*sd, *fd, contentlength, resbuf, resbuflen, resbufpos);
         if (error) {
-            printf("copybytes problem\n");
+            fprintf(stderr, "[%d][%s] - copybytes failed\n", __LINE__, __func__);
             return -1;
         }
     } else {
@@ -591,7 +593,7 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
          */
         error = copybytes(*sd, *fd, OFF_MAX, resbuf, resbuflen, resbufpos);
         if (error == -1) {
-            printf("copybytes problem\n");
+            fprintf(stderr, "[%d][%s] - copybytes failed\n", __LINE__, __func__);
             return -1;
         }
         *pipelined = 0;
@@ -606,7 +608,6 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
 
     if (protocol == IPPROTO_SCTP) {
         fprintf(stderr, "SCTP Stream %d - ", lastStream);
-        streamstatus[lastStream] = STREAM_FREE;
     }
 
     if (statuscode == 200)
@@ -660,6 +661,7 @@ main(int argc, char *argv[])
     int maxfd = 0;
     int selectsock = -1;
 
+    /* Initialize open (unsent) requests and pending requests queues */
     TAILQ_INIT(&requests_open);
     TAILQ_INIT(&requests_pending);
 
@@ -808,9 +810,11 @@ main(int argc, char *argv[])
         }
 
         /* Bind sd to select functions */
-        if (num_req_open > 0) {
+        //if (num_req_open > 0) {
+            printf("fdset for fdsetsend\n");
+            // FELIX!!!!
             FD_SET(sd, &fdsetsend);
-        }
+        //}
         FD_SET(sd, &fdsetrecv);
 
         maxfd = MAX(STDIN_FILENO, sd) + 1;
@@ -823,6 +827,7 @@ main(int argc, char *argv[])
         }
         fprintf(stderr, "after select\n");
 
+        /* Ready to read a new request from stdin */
         if (FD_ISSET(STDIN_FILENO, &fdsetrecv)) {
             printf("stdin - recv\n");
 
@@ -838,22 +843,27 @@ main(int argc, char *argv[])
 
             if (fgets(request->url, BUFSIZ, stdin) == NULL) {
                 perror("fgets failed");
-                exit(EXIT_FAILURE);
+                interactive = 0;
+                //continue;
+                //exit(EXIT_FAILURE);
+            } else {
+                request->url[strcspn(request->url, "\n")] = 0;
+                TAILQ_INSERT_TAIL(&requests_open, request, entries);
+                num_req_open++;
+                printf("queueing : %s\n", request->url);
             }
 
-            request->url[strcspn(request->url, "\n")] = 0;
+        /* Ready to recv from socket */
+        }
 
-            printf("queueing : %s\n", request->url);
-            TAILQ_INSERT_TAIL(&requests_open, request, entries);
-            num_req_open++;
-        } else if (FD_ISSET(STDIN_FILENO, &fdsetrecv)) {
-            printf("stdin - send\n");
-        } else if (FD_ISSET(sd, &fdsetrecv)) {
+        if (FD_ISSET(sd, &fdsetrecv)) {
             printf("sd - recv\n");
-        } else if (FD_ISSET(sd, &fdsetsend)) {
+
+        /* Ready to send from socket */
+        }
+
+        if (FD_ISSET(sd, &fdsetsend)) {
             printf("sd - send\n");
-        } else {
-            printf("somehting else\n");
         }
 
         /*
@@ -874,7 +884,8 @@ main(int argc, char *argv[])
             /* If not in the middle of a request, make one */
             if (reqbuf == NULL) {
                 if ((request = TAILQ_FIRST(&requests_open)) == NULL) {
-                    fprintf(stderr, "This should not happen ... make request\n");
+                    fprintf(stderr, "[%d][%s] - no open requests left... fix it!\n", __LINE__, __func__);
+                    exit(EXIT_FAILURE);
                 }
 
                 if ((reqbuflen = asprintf(&reqbuf,
@@ -884,7 +895,7 @@ main(int argc, char *argv[])
                     "%s"
                     "\r\n",
                     request->url, servername, env_HTTP_USER_AGENT,
-                    (num_req_open == 1) ? "Connection: Close\r\n" : "Connection: Keep-Alive\r\n"
+                    (num_req_open == 1 && !interactive) ? "Connection: Close\r\n" : "Connection: Keep-Alive\r\n"
                 )) == -1) {
                     err(1, "asprintf");
                 }
@@ -895,12 +906,12 @@ main(int argc, char *argv[])
             /* If in pipelined mode, try to send the request */
             if (pipelined && streamsbusy == 0) {
                 if (send_request(sd, reqbuf, &reqbuflen, &reqbufpos) == -1) {
-                    fprintf(stderr, "send_request failed\n");
+                    fprintf(stderr, "[%d][%s] - send_request() failed\n", __LINE__, __func__);
                     goto conndied; //handle more precisely...
                 }
 
                 if (reqbufpos < reqbuflen) {
-                    printf("pipelined - reqbufpos < reqbuflen\n");
+                    fprintf(stderr, "[%d][%s] - reqbufpos < reqbuflen or all streams busy...\n", __LINE__, __func__);
                     if (errno != EAGAIN && streamsbusy == 0) {
                         goto conndied;
                     }
@@ -912,8 +923,8 @@ main(int argc, char *argv[])
 
                     /* move queue element from open to pending */
                     if ((request = TAILQ_FIRST(&requests_open)) == NULL) {
-                        fprintf(stderr, "[%d][%s] - this should not happen...\n", __LINE__, __func__);
-                        exit(-1);
+                        fprintf(stderr, "[%d][%s] - this should not happen... dafuq!?\n", __LINE__, __func__);
+                        exit(EXIT_FAILURE);
                     }
                     TAILQ_REMOVE(&requests_open, request, entries);
                     TAILQ_INSERT_TAIL(&requests_pending, request, entries);
@@ -922,7 +933,7 @@ main(int argc, char *argv[])
                     num_req_open--;
                     num_req_pending++;
 
-                    printf("request : %s - open -> pending\n", request->url);
+                    fprintf(stderr, "[%d][%s] - %s : open -> pending\n", __LINE__, __func__, request->url);
                 }
             }
         }
@@ -930,19 +941,21 @@ main(int argc, char *argv[])
         /* Put connection back into blocking mode */
         if (pipelined) {
             if (fcntl(sd, F_SETFL, sdflags) == -1) {
-                err(1, "fcntl");
+                fprintf(stderr, "[%d][%s] - fcntl : non-blocking -> blocking failed (non-blocking part)\n", __LINE__, __func__);
             }
         }
 
         /* sending last request ... do we need to blocking-send a request? */
+        //felix : num_req_open > 0 ?
         if (nreq == nres && streamsbusy == 0) {
+            printf("blocking send_request()\n");
             if (send_request(sd, reqbuf, &reqbuflen, &reqbufpos) == -1) {
-                fprintf(stderr, "send_request failed\n");
+                fprintf(stderr, "[%d][%s] - send_request() failed\n", __LINE__, __func__);
                 goto conndied; //handle more precisely...
             }
 
             if (reqbufpos < reqbuflen) {
-                printf("non pipelined - reqbufpos < reqbuflen\n");
+                fprintf(stderr, "[%d][%s] - reqbufpos < reqbuflen or all streams busy...\n", __LINE__, __func__);
                 if (errno != EAGAIN && streamsbusy == 0) {
                     goto conndied;
                 }
@@ -953,7 +966,7 @@ main(int argc, char *argv[])
 
                 /* move queue element from open to pending */
                 if ((request = TAILQ_FIRST(&requests_open)) == NULL) {
-                    fprintf(stderr, "%s - this should not happen...\n", __func__);
+                    fprintf(stderr, "[%d][%s] - this should not happen... dafuq?!\n", __LINE__, __func__);
                     exit(-1);
                 }
                 TAILQ_REMOVE(&requests_open, request, entries);
@@ -962,26 +975,34 @@ main(int argc, char *argv[])
                 nreq++;
                 num_req_open--;
                 num_req_pending++;
-
-                printf("request : %s - open -> pending\n", request->url);
+                fprintf(stderr, "[%d][%s] - %s : open -> pending (blocking part)\n", __LINE__, __func__, request->url);
             }
         }
 
         /* Get response and delete entry from pending list */
-        if (handle_response(&sd, &fd, resbuf, &resbuflen, &resbufpos, &nres, &keepalive, &pipelined) == 0) {
-            request = TAILQ_FIRST(&requests_pending);
-            TAILQ_REMOVE(&requests_pending, request, entries);
-            free(request);
 
-            /* We've finished this file! */
-            nres++;
-            num_req_pending--;
+        /* take head element from pending queue */
+        if ((request = TAILQ_FIRST(&requests_pending)) != NULL) {
+            /* handle_response succeeded - remove pending element from queue */
+            fprintf(stderr, "handling response for %s \n", request->url);
+            if (handle_response(&sd, &fd, resbuf, &resbuflen, &resbufpos, &nres, request, &keepalive, &pipelined) == 0) {
+                TAILQ_REMOVE(&requests_pending, request, entries);
+                free(request);
 
-            /* at least one stream is free for a new request */
-            streamsbusy = 0;
+                /* We've finished this file! */
+                nres++;
+                num_req_pending--;
+                streamstatus[lastStream] = STREAM_FREE;
+                /* at least one stream is free for a new request */
+                streamsbusy = 0;
+            }
 
-            continue;
+        } else if (request == NULL) {
+            fprintf(stderr, "[%d][%s] - no pending request left... fix logic!\n", __LINE__, __func__);
+            //exit(EXIT_FAILURE);
+            goto cleanupconn;
         }
+
 
         /*
          * If necessary, clean up this connection so that we
@@ -1022,9 +1043,26 @@ cleanupconn:
             reqbuf = NULL;
         }
         nreq = nres; // we did'nt sent all nres..
+
+        while(num_req_pending > 0) {
+            /* pending requests have to be resent */
+            if ((request = TAILQ_LAST(&requests_pending, request_queue)) == NULL) {
+                fprintf(stderr, "[%d][%s] - this should not happen\n", __LINE__, __func__);
+                //exit(EXIT_FAILURE);
+            }
+            TAILQ_REMOVE(&requests_pending, request, entries);
+            TAILQ_INSERT_HEAD(&requests_open, request, entries);
+            num_req_open++;
+            num_req_pending--;
+
+            fprintf(stderr, "[%d][%s] - %s : pending -> open\n", __LINE__, __func__, request->url);
+        }
+
+
         res = res0;
         pipelined = 0;
         resbuflen = 0;
+        resbufpos = 0;
         continue;
     }
 
