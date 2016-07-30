@@ -60,9 +60,10 @@ static const char *     env_HTTP_USER_AGENT;
 static char *           env_HTTP_TIMEOUT;
 static char *           env_HTTP_TRANSPORT_PROTOCOL;
 static char *           env_HTTP_SCTP_UDP_ENCAPS_PORT;
+static char *           env_HTTP_DEBUG;
 
 static struct           timeval timo = {15, 0};
-
+static uint8_t          debug = 0;                          /* 0 = none | 1 = verbose | 2 = very verbose */
 static in_port_t        udp_encaps_port = 0;
 static int              protocol = IPPROTO_TCP;
 static uint8_t          streamstatus[NUM_SCTP_STREAMS];
@@ -167,6 +168,16 @@ readenv(void)
 
     env_HTTP_SCTP_UDP_ENCAPS_PORT = getenv("HTTP_SCTP_UDP_ENCAPS_PORT");
     if (env_HTTP_SCTP_UDP_ENCAPS_PORT != NULL) {
+        port = strtol(env_HTTP_SCTP_UDP_ENCAPS_PORT, &p, 10);
+        if ((*env_HTTP_SCTP_UDP_ENCAPS_PORT == '\0') || (*p != '\0') || (port < 0) || (port > 65535)) {
+            warnx("HTTP_SCTP_UDP_ENCAPS_PORT (%s) is not a valid port number", env_HTTP_SCTP_UDP_ENCAPS_PORT);
+        } else {
+            udp_encaps_port = (in_port_t)port;
+        }
+    }
+
+    env_HTTP_DEBUG = getenv("HTTP_DEBUG");
+    if (env_HTTP_DEBUG != NULL) {
         port = strtol(env_HTTP_SCTP_UDP_ENCAPS_PORT, &p, 10);
         if ((*env_HTTP_SCTP_UDP_ENCAPS_PORT == '\0') || (*p != '\0') || (port < 0) || (port > 65535)) {
             warnx("HTTP_SCTP_UDP_ENCAPS_PORT (%s) is not a valid port number", env_HTTP_SCTP_UDP_ENCAPS_PORT);
@@ -632,7 +643,6 @@ main(int argc, char *argv[])
 #ifdef SCTP_REMOTE_UDP_ENCAPS_PORT
     struct sctp_udpencaps encaps;   /* SCTP/UDP information */
 #endif
-
     char * reqbuf = NULL;           /* Request buffer */
     int reqbufpos = 0;              /* Request buffer position */
     int reqbuflen = 0;              /* Request buffer length */
@@ -919,7 +929,6 @@ main(int argc, char *argv[])
                 } else {
                     free(reqbuf);
                     reqbuf = NULL;
-
 
                     /* move queue element from open to pending */
                     if ((request = TAILQ_FIRST(&requests_open)) == NULL) {
