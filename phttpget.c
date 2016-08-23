@@ -85,8 +85,8 @@ struct request_queue requests_pending;
 
 #define MAX(a,b) (((a)>(b))?(a):(b))
 
-
 #ifndef __FreeBSD__
+/* Locate a substring in a string */
 char *
 strnstr(const char *s, const char *find, size_t slen)
 {
@@ -109,29 +109,13 @@ strnstr(const char *s, const char *find, size_t slen)
 }
 #endif
 
+/* Print usage and exit */
 static void
 usage(void)
 {
     fprintf(stderr, "usage: phttpget server [file1 file2 filnen]\n");
     exit(EX_USAGE);
 }
-
-
-/* Lookup next free SCTP stream */
-static int
-getnextstream(struct sctp_sndinfo *sndinfo)
-{
-    uint32_t tempindex;
-    for (tempindex = 0; tempindex < NUM_SCTP_STREAMS; tempindex++) {
-        if (streamstatus[tempindex] == STREAM_FREE) {
-            streamstatus[tempindex] = STREAM_USED;
-            sndinfo->snd_sid = tempindex;
-            return 0;
-        }
-    }
-    return -1;
-}
-
 
 /* Read environment variables */
 static void
@@ -143,14 +127,14 @@ readenv(void)
 
     env_HTTP_USER_AGENT = getenv("HTTP_USER_AGENT");
     if (env_HTTP_USER_AGENT == NULL) {
-        env_HTTP_USER_AGENT = "phttpget/0.1";
+        env_HTTP_USER_AGENT = "phttpget/0.2";
     }
 
     env_HTTP_TIMEOUT = getenv("HTTP_TIMEOUT");
     if (env_HTTP_TIMEOUT != NULL) {
         http_timeout = strtol(env_HTTP_TIMEOUT, &p, 10);
         if ((*env_HTTP_TIMEOUT == '\0') || (*p != '\0') || (http_timeout < 0)) {
-            warnx("HTTP_TIMEOUT (%s) is not a positive integer", env_HTTP_TIMEOUT);
+            fprintf(stderr, "HTTP_TIMEOUT (%s) is not a positive integer\n", env_HTTP_TIMEOUT);
         } else {
             timo.tv_sec = http_timeout;
         }
@@ -162,7 +146,7 @@ readenv(void)
         } else if (strncasecmp(env_HTTP_TRANSPORT_PROTOCOL, "SCTP", 4) == 0) {
             protocol = IPPROTO_SCTP;
         } else {
-            warnx("HTTP_TRANSPORT_PROTOCOL (%s) not supported", env_HTTP_TRANSPORT_PROTOCOL);
+            fprintf(stderr, "HTTP_TRANSPORT_PROTOCOL (%s) not supported\n", env_HTTP_TRANSPORT_PROTOCOL);
         }
     }
 
@@ -170,37 +154,31 @@ readenv(void)
     if (env_HTTP_SCTP_UDP_ENCAPS_PORT != NULL) {
         port = strtol(env_HTTP_SCTP_UDP_ENCAPS_PORT, &p, 10);
         if ((*env_HTTP_SCTP_UDP_ENCAPS_PORT == '\0') || (*p != '\0') || (port < 0) || (port > 65535)) {
-            warnx("HTTP_SCTP_UDP_ENCAPS_PORT (%s) is not a valid port number", env_HTTP_SCTP_UDP_ENCAPS_PORT);
+            fprintf(stderr, "HTTP_SCTP_UDP_ENCAPS_PORT (%s) is not a valid port number\n", env_HTTP_SCTP_UDP_ENCAPS_PORT);
         } else {
             udp_encaps_port = (in_port_t)port;
         }
     }
 
     env_HTTP_DEBUG = getenv("HTTP_DEBUG");
-    if (env_HTTP_DEBUG != NULL) {
-        port = strtol(env_HTTP_SCTP_UDP_ENCAPS_PORT, &p, 10);
-        if ((*env_HTTP_SCTP_UDP_ENCAPS_PORT == '\0') || (*p != '\0') || (port < 0) || (port > 65535)) {
-            warnx("HTTP_SCTP_UDP_ENCAPS_PORT (%s) is not a valid port number", env_HTTP_SCTP_UDP_ENCAPS_PORT);
-        } else {
-            udp_encaps_port = (in_port_t)port;
-        }
+    if (env_HTTP_DEBUG == NULL) {
+        debug = 1;
+    } else {
+        fprintf(stderr, "Debug output enabled...\n");
+        debug = 1;
     }
-
-    printf("BUFSIZ : %d\n", BUFSIZ);
 }
 
 static int
 readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
 {
-    ssize_t len;
+    ssize_t len = 0;
     struct msghdr msg;
     struct iovec iov;
     char cmsgbuf[CMSG_SPACE(sizeof(struct sctp_rcvinfo))];
     struct sctp_rcvinfo *rcvinfo;
 
     memset(cmsgbuf, 0, CMSG_SPACE(sizeof(struct sctp_rcvinfo)));
-
-
 
     while (strnstr(resbuf + *resbufpos, "\r\n", *resbuflen - *resbufpos) == NULL) {
         /* Move buffered data to the start of the buffer */
@@ -228,25 +206,26 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
         rcvinfo = (struct sctp_rcvinfo *)CMSG_DATA(cmsgbuf);
         len = recvmsg(sd, &msg, 0);
 
-        // remember stream
+        /* Stream we received data from */
         if (protocol == IPPROTO_SCTP) {
             lastStream = rcvinfo->rcv_sid;
         }
 
-        //
+        /* If recvmsg returned 0 or -1 (no interrupt) - we stop reading */
         if ((len == 0) || ((len == -1) && (errno != EINTR))) {
             fprintf(stderr, "[%d][%s] - recvmsg returned 0 or -1\n", __LINE__, __func__);
             return -1;
-        } else if (len != -1) {
+        } else if (len > 0) {
             *resbuflen += len;
         }
     }
+
     return 0;
 }
 
+/* Copy bytes from one sd fd to sd fd */
 static int
-copybytes(int sd, int fd, off_t copylen, char * resbuf, int * resbuflen,
-    int * resbufpos)
+copybytes(int sd, int fd, off_t copylen, char *resbuf, int *resbuflen, int *resbufpos)
 {
     ssize_t len;
     struct msghdr msg;
@@ -260,16 +239,22 @@ copybytes(int sd, int fd, off_t copylen, char * resbuf, int * resbuflen,
 
         /* Write data from resbuf to fd */
         len = *resbuflen - *resbufpos;
-        if (copylen < len)
+        if (copylen < len) {
             len = copylen;
+        }
+
+        /* Write to file until resbuf is "empty" before calling recvmsg */
         if (len > 0) {
-            if (fd != -1) {
-                len = write(fd, resbuf + *resbufpos, len);
+            if (fd == -1) {
+                fprintf(stderr, "[%d][%s] - write() failed - fd == -1\n", __LINE__, __func__);
+                exit(EXIT_FAILURE);
             }
-            if (len == -1) {
+
+            if ((len = write(fd, resbuf + *resbufpos, len)) == -1) {
                 fprintf(stderr, "[%d][%s] - write() failed\n", __LINE__, __func__);
                 exit(EXIT_FAILURE);
             }
+
             *resbufpos += len;
             copylen -= len;
             continue;
@@ -284,16 +269,9 @@ copybytes(int sd, int fd, off_t copylen, char * resbuf, int * resbuflen,
         msg.msg_control = cmsgbuf;
         msg.msg_controllen = sizeof(cmsgbuf);
         rcvinfo = (struct sctp_rcvinfo *)CMSG_DATA(cmsgbuf);
-        len = recvmsg(sd, &msg, 0);
-
-        // felix xxx - check!!
-        if (protocol == IPPROTO_SCTP) {
-            lastStream = rcvinfo->rcv_sid;
-        }
 
         /* Read more data into buffer */
-        //len = recv(sd, resbuf, BUFSIZ, 0);
-        if (len == -1) {
+        if ((len = recvmsg(sd, &msg, 0)) == -1) {
             if (errno == EINTR) {
                 continue;
             }
@@ -304,6 +282,9 @@ copybytes(int sd, int fd, off_t copylen, char * resbuf, int * resbuflen,
         } else {
             *resbuflen = len;
             *resbufpos = 0;
+            if (protocol == IPPROTO_SCTP) {
+                lastStream = rcvinfo->rcv_sid;
+            }
         }
     }
 
@@ -318,6 +299,7 @@ send_request(int sd,  char *reqbuf, int *reqbuflen, int *reqbufpos) {
     struct sctp_sndinfo *sndinfo;
     struct cmsghdr *cmsg;
     int len;
+    int i;
 
     /* initialize */
     memset(cmsgbuf, 0, CMSG_SPACE(sizeof(struct sctp_sndinfo)));
@@ -336,12 +318,20 @@ send_request(int sd,  char *reqbuf, int *reqbuflen, int *reqbufpos) {
         cmsg->cmsg_level = IPPROTO_SCTP;
         cmsg->cmsg_type = SCTP_SNDINFO;
         cmsg->cmsg_len = CMSG_LEN(sizeof(struct sctp_sndinfo));
-
         sndinfo = (struct sctp_sndinfo*) CMSG_DATA(cmsg);
+        streamsbusy = 1;
 
         /* lookup next free stream - if all streams busy return with -2 */
-        if (getnextstream(sndinfo) == -1) {
-            streamsbusy = 1;
+        for (i = 0; i < NUM_SCTP_STREAMS; i++) {
+            if (streamstatus[i] == STREAM_FREE) {
+                streamstatus[i] = STREAM_USED;
+                sndinfo->snd_sid = i;
+                streamsbusy = 0;
+                break;
+            }
+        }
+
+        if (streamsbusy == 1) {
             fprintf(stderr, "[%d][%s] - all SCTP streams are busy...\n", __LINE__, __func__);
             return -2;
         }
@@ -451,7 +441,9 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
                 *keepalive = 1;
             }
 
-            fprintf(stderr, "keep-alive : %d - pipelined: %d\n", *keepalive, *pipelined);
+            if (debug) {
+                fprintf(stderr, "[%d][%s] - Keep-Alive : %d - Pipelined : %d\n", __LINE__, __func__, *keepalive, *pipelined);
+            }
 
             /* Next header... */
             continue;
@@ -532,13 +524,14 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
         }
 
         if (strlen(fname) == 0) {
-            errx(1, "Cannot obtain file name from %s\n", request->url);
+            fprintf(stderr, "[%d][%s] - Cannot optain file name\n", __LINE__, __func__);
+            exit(EXIT_FAILURE);
         }
 
         /* Open file for writing */
-        *fd = open(fname, O_CREAT | O_TRUNC | O_WRONLY, 0644);
-        if (*fd == -1) {
-            errx(1, "open(%s)", fname);
+        if ((*fd = open(fname, O_CREAT | O_TRUNC | O_WRONLY, 0644)) == -1) {
+            fprintf(stderr, "[%d][%s] - Failed to open file for writing\n", __LINE__, __func__);
+            exit(EXIT_FAILURE);
         }
     };
 
@@ -695,29 +688,28 @@ main(int argc, char *argv[])
 
 
     if (argc < 1) {
-        printf("switching to interactive mode\n");
+        fprintf(stderr, "[%d][%s] - interactive mode\n", __LINE__, __func__);
         interactive = 1;
     }
 
     /* Parse requests by cmdline arguments and queue them */
     for (i = 0; i < argc; i++) {
         if ((request = malloc(sizeof(struct request))) == NULL) {
-            perror("malloc failed");
+            fprintf(stderr, "[%d][%s] - malloc failed\n", __LINE__, __func__);
             exit(EXIT_FAILURE);
         }
 
         request->url = argv[i];
-        printf("queueing : %s\n", argv[i]);
+        fprintf(stderr, "[%d][%s] - queueing : %s\n", __LINE__, __func__, request->url);
         TAILQ_INSERT_TAIL(&requests_open, request, entries);
         num_req_open++;
     }
 
-    printf("requests open : %d\n", num_req_open);
+    fprintf(stderr, "[%d][%s] - %d requests open\n", __LINE__, __func__, num_req_open);
 
     /* Allocate response buffer */
-    resbuf = malloc(BUFSIZ);
-    if (resbuf == NULL) {
-        err(1, "malloc");
+    if ((resbuf = malloc(BUFSIZ)) == NULL) {
+        fprintf(stderr, "[%d][%s] - malloc failed\n", __LINE__, __func__);
     }
 
     /* Server lookup */
@@ -732,10 +724,12 @@ main(int argc, char *argv[])
     error = getaddrinfo(servername, "80", &hints, &res0);
 #endif
     if (error) {
-        errx(1, "host = %s, port = %s: %s", servername, "http", gai_strerror(error));
+        fprintf(stderr, "[%d][%s] - host = %s, port = %s: %s\n", __LINE__, __func__, servername, "http", gai_strerror(error));
+        exit(EXIT_FAILURE);
     }
     if (res0 == NULL) {
-        errx(1, "could not look up %s", servername);
+        fprintf(stderr, "[%d][%s] - lookup for %s failed\n", __LINE__, __func__, servername);
+        exit(EXIT_FAILURE);
     }
     res = res0;
 
@@ -746,7 +740,8 @@ main(int argc, char *argv[])
         for (; sd == -1; res = res->ai_next) {
             /* No addresses left to try :-( */
             if (res == NULL) {
-                errx(1, "Could not connect to %s", servername);
+                fprintf(stderr, "[%d][%s] - Could not connect to %s\n", __LINE__, __func__, servername);
+                exit(EXIT_FAILURE);
             }
 
             /* Create a socket... */
@@ -768,15 +763,15 @@ main(int argc, char *argv[])
                 initmsg.sinit_max_attempts = 0;   /* Use default */
                 initmsg.sinit_max_init_timeo = 0; /* Use default */
                 if (setsockopt(sd, IPPROTO_SCTP, SCTP_INITMSG, (char*) &initmsg, sizeof(initmsg) ) < 0 ) {
-                    fprintf(stderr, "problem : SCTP_INITMSG\n");
-                    exit(-1);
+                    fprintf(stderr, "[%d][%s] - setsockopt failed\n", __LINE__, __func__);
+                    exit(EXIT_FAILURE);
                 }
 
                 /* Enable RCVINFO delivery */
                 val = 1;
                 if (setsockopt(sd, IPPROTO_SCTP, SCTP_RECVRCVINFO, (char*) &val, sizeof(val) ) < 0 ) {
-                    fprintf(stderr, "problem : SCTP_RECVRCVINFO\n");
-                    exit(-1);
+                    fprintf(stderr, "[%d][%s] - setsockopt failed\n", __LINE__, __func__);
+                    exit(EXIT_FAILURE);
                 }
 
 #ifdef SCTP_REMOTE_UDP_ENCAPS_PORT
@@ -788,7 +783,8 @@ main(int argc, char *argv[])
                 setsockopt(sd, IPPROTO_SCTP, SCTP_REMOTE_UDP_ENCAPS_PORT, (void *)&encaps, (socklen_t)sizeof(encaps));
 #else
                 if (udp_encaps_port > 0) {
-                    errx(1, "UDP encapsulation not supported");
+                    fprintf(stderr, "[%d][%s] - UDP encapsulation unsupported\n", __LINE__, __func__);
+                    exit(EXIT_FAILURE);
                 }
 #endif
             }
@@ -806,6 +802,10 @@ main(int argc, char *argv[])
                 continue;
             }
 
+            if (debug) {
+                fprintf(stderr, "[%d][%s] - connected\n", __LINE__, __func__);
+            }
+
             //felix - why?!
             firstreq = nres;
         }
@@ -814,66 +814,67 @@ main(int argc, char *argv[])
         FD_ZERO(&fdsetrecv);
         FD_ZERO(&fdsetsend);
 
-        /* Hook stdin in select */
+        /* Hook stdin in select if we are interactive */
         if (interactive) {
             FD_SET(STDIN_FILENO, &fdsetrecv);
         }
 
-        /* Bind sd to select functions */
-        //if (num_req_open > 0) {
-            printf("fdset for fdsetsend\n");
-            // FELIX!!!!
+        /* Bind sd to select functions - if we have requests open, hook for sending ... */
+        if (num_req_open > 0) {
             FD_SET(sd, &fdsetsend);
-        //}
+        }
+        /* ... and always for receiving */
         FD_SET(sd, &fdsetrecv);
 
         maxfd = MAX(STDIN_FILENO, sd) + 1;
 
         /* Select section - handle stdin and socket */
-        fprintf(stderr, "before select\n");
         if ((selectsock = select(maxfd, &fdsetrecv, &fdsetsend, NULL, NULL)) < 0) {
-			perror("select");
-			exit(EXIT_FAILURE);
+            fprintf(stderr, "[%d][%s] - select failed\n", __LINE__, __func__);
+            exit(EXIT_FAILURE);
         }
-        fprintf(stderr, "after select\n");
 
         /* Ready to read a new request from stdin */
         if (FD_ISSET(STDIN_FILENO, &fdsetrecv)) {
-            printf("stdin - recv\n");
-
+            if (debug) {
+                fprintf(stderr, "[%d][%s] - select for STDIN\n", __LINE__, __func__);
+            }
             if ((request = malloc(sizeof(struct request))) == NULL) {
-                perror("malloc failed");
+                fprintf(stderr, "[%d][%s] - malloc failed\n", __LINE__, __func__);
                 exit(EXIT_FAILURE);
             }
 
             if ((request->url = malloc(BUFSIZ)) == NULL) {
-                perror("malloc failed");
+                fprintf(stderr, "[%d][%s] - malloc failed\n", __LINE__, __func__);
                 exit(EXIT_FAILURE);
             }
 
             if (fgets(request->url, BUFSIZ, stdin) == NULL) {
-                perror("fgets failed");
-                interactive = 0;
-                //continue;
-                //exit(EXIT_FAILURE);
+                fprintf(stderr, "[%d][%s] - fgets failed\n", __LINE__, __func__);
+                exit(EXIT_FAILURE);
             } else {
                 request->url[strcspn(request->url, "\n")] = 0;
                 TAILQ_INSERT_TAIL(&requests_open, request, entries);
                 num_req_open++;
-                printf("queueing : %s\n", request->url);
+                if (debug) {
+                    fprintf(stderr, "[%d][%s] - queueing : %s\n", __LINE__, __func__, request->url);
+                }
             }
-
         /* Ready to recv from socket */
         }
 
         if (FD_ISSET(sd, &fdsetrecv)) {
-            printf("sd - recv\n");
+            if (debug) {
+                fprintf(stderr, "[%d][%s] - select for sd recv\n", __LINE__, __func__);
+            }
 
         /* Ready to send from socket */
         }
 
         if (FD_ISSET(sd, &fdsetsend)) {
-            printf("sd - send\n");
+            if (debug) {
+                fprintf(stderr, "[%d][%s] - select for sd send\n", __LINE__, __func__);
+            }
         }
 
         /*
@@ -884,7 +885,8 @@ main(int argc, char *argv[])
         if (pipelined) {
             sdflags = fcntl(sd, F_GETFL);
             if (fcntl(sd, F_SETFL, sdflags | O_NONBLOCK) == -1) {
-                err(1, "fcntl");
+                fprintf(stderr, "[%d][%s] - fcntl failed\n", __LINE__, __func__);
+                exit(EXIT_FAILURE);
             }
         }
 
@@ -907,7 +909,8 @@ main(int argc, char *argv[])
                     request->url, servername, env_HTTP_USER_AGENT,
                     (num_req_open == 1 && !interactive) ? "Connection: Close\r\n" : "Connection: Keep-Alive\r\n"
                 )) == -1) {
-                    err(1, "asprintf");
+                    fprintf(stderr, "[%d][%s] - asprintf failed\n", __LINE__, __func__);
+                    exit(EXIT_FAILURE);
                 }
 
                 reqbufpos = 0;
@@ -976,7 +979,7 @@ main(int argc, char *argv[])
                 /* move queue element from open to pending */
                 if ((request = TAILQ_FIRST(&requests_open)) == NULL) {
                     fprintf(stderr, "[%d][%s] - this should not happen... dafuq?!\n", __LINE__, __func__);
-                    exit(-1);
+                    exit(EXIT_FAILURE);
                 }
                 TAILQ_REMOVE(&requests_open, request, entries);
                 TAILQ_INSERT_TAIL(&requests_pending, request, entries);
@@ -1032,14 +1035,17 @@ conndied:
          */
 
         if (nres == firstreq) {
-            errx(1, "Connection failure");
+            fprintf(stderr, "[%d][%s] - connection failure\n", __LINE__, __func__);
+            exit(EXIT_FAILURE);
         }
 
 cleanupconn:
         /*
          * Clean up our connection and keep on going
          */
-        printf("cleanupconn?!?!?!?!?\n");
+        if (debug) {
+            fprintf(stderr, "[%d][%s] - cleanupconn\n", __LINE__, __func__);
+        }
         shutdown(sd, SHUT_RDWR);
         close(sd);
         sd = -1;
