@@ -8,7 +8,7 @@ else
 fi
 echo 'using' $HTTP_TRANSPORT_PROTOCOL
 
-$2 ./phttpget 192.168.56.4 \
+$2 ./phttpget localhost \
 chunks/chunk-0-0.jpg \
 chunks/chunk-0-1.jpg \
 chunks/chunk-0-2.jpg \
@@ -111,3 +111,4 @@ chunks/chunk-0-48.jpg \
 chunks/chunk-0-49.jpg
 
 rm *.jpg
+
