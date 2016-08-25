@@ -56,9 +56,12 @@ __FBSDID("$FreeBSD: head/usr.sbin/portsnap/phttpget/phttpget.c 190679 2009-04-03
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 /* maximum SCTP streams */
 #define NUM_SCTP_STREAMS    10
+#define FIFO_BUFFER_SIZE    1024
 
 #define LOG_ALL             0
 #define LOG_ERR             1
@@ -74,7 +77,7 @@ static char *           env_HTTP_DEBUG;
 static struct           timeval timo = {15, 0};
 static uint8_t          log_level = LOG_INF;                          /* 0 = none | 1 = error | 2 = verbose | 3 = very verbose */
 static in_port_t        udp_encaps_port = 0;
-static int              protocol = IPPROTO_SCTP;
+static int              protocol = IPPROTO_TCP;
 static uint8_t          streamstatus[NUM_SCTP_STREAMS];
 static uint32_t         lastStream = 0;                     /* Last SCTP stream read from */
 static char             *servername;                        /* Name of server to connect with */
@@ -82,11 +85,28 @@ static uint8_t          streamsbusy = 0;                    /* Indicator if all 
 static struct timeval   tv_init;
 static uint32_t         bytes_header = 0;
 static uint32_t         bytes_payload = 0;
+static uint8_t          interactive = 0;
+static uint8_t          save_file = 0;                      /* save received data to file */
+
+
+int fifo_in_fd = 0;
+int fifo_out_fd = 0;
+char *fifo_in_name = "/tmp/felixa";
+char *fifo_out_name = "/tmp/felixb";
 
 enum stream_status {STREAM_FREE, STREAM_USED};
 
+struct sctp_pipe_data {
+    uint32_t    pathlen;
+    uint32_t    size_header;
+    uint32_t    size_payload;
+    pthread_t   tid;
+    char        path[FIFO_BUFFER_SIZE];
+};
+
 struct request {
     char *url;
+    struct sctp_pipe_data pipe_data;
     TAILQ_ENTRY(request) entries;
 };
 
@@ -335,6 +355,7 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
         /* If the buffer is full, complain */
         if (*resbuflen == BUFSIZ) {
             mylog(LOG_INF, "[%d][%s] - buffer is full", __LINE__, __func__);
+            exit(EXIT_FAILURE);
             return -1;
         }
 
@@ -529,7 +550,7 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
         *resbufpos = (eolp - resbuf) + 2;
         *eolp = '\0';
 
-        bytes_header += strlen(hln);
+        bytes_header += strlen(hln) + 2;
 
         mylog(LOG_INF, "[%d][%s] - %s", __LINE__, __func__, hln);
 
@@ -661,7 +682,7 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
      * There should be a message body coming, but we only want
      * to send it to a file if the status code is 200
      */
-    if (statuscode == 200) {
+    if (statuscode == 200 && save_file == 1) {
         /* Generate a file name for the download */
         fname = strrchr(request->url, '/');
         if (fname == NULL) {
@@ -764,6 +785,16 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
     mylog(LOG_INF, "\t PAYLOAD  : %d", bytes_payload - bytes_payload_tmp);
     mylog(LOG_INF, "#####################");
 
+    if (interactive) {
+        if ((request = TAILQ_FIRST(&requests_pending)) != NULL) {
+            request->pipe_data.size_header = bytes_header - bytes_header_tmp;
+            request->pipe_data.size_payload = bytes_payload - bytes_payload_tmp;
+
+            write(fifo_out_fd, &(request->pipe_data), sizeof(struct sctp_pipe_data));
+            printf("\n####\nwriting to pipe : %d - %d\n####\n", request->pipe_data.size_header, request->pipe_data.size_payload = bytes_payload);
+        }
+    }
+
     return 0;
 }
 
@@ -793,10 +824,9 @@ main(int argc, char *argv[])
     int resbufpos = 0;              /* Response buffer position */
     int num_req_open = 0;
     int num_req_pending = 0;
-    //int num_req_finished = 0;
+    int num_req_finished = 0;
     struct fd_set fdsetrecv;
     struct fd_set fdsetsend;
-    int interactive = 0;
     int maxfd = 0;
     int selectsock = -1;
 
@@ -805,7 +835,6 @@ main(int argc, char *argv[])
     TAILQ_INIT(&requests_pending);
 
     gettimeofday(&tv_init, NULL);
-
 
     /* Check that the arguments are sensible */
     if (argc < 2) {
@@ -817,26 +846,6 @@ main(int argc, char *argv[])
 
     /* Get server name and adjust arg[cv] to point at file names */
     servername = argv[1];
-
-    if (argc < 3) {
-        mylog(LOG_ALL, "[%d][%s] - interactive mode", __LINE__, __func__);
-        interactive = 1;
-    } else {
-        /* Parse requests by cmdline arguments and queue them */
-        for (i = 2; i < argc; i++) {
-            if ((request = malloc(sizeof(struct request))) == NULL) {
-                mylog(LOG_ERR, "[%d][%s] - malloc failed", __LINE__, __func__);
-                exit(EXIT_FAILURE);
-            }
-
-            request->url = argv[i];
-            mylog(LOG_INF, "[%d][%s] - queueing : %s", __LINE__, __func__, request->url);
-            TAILQ_INSERT_TAIL(&requests_open, request, entries);
-            num_req_open++;
-        }
-
-        mylog(LOG_INF, "[%d][%s] - %d requests open", __LINE__, __func__, num_req_open);
-    }
 
     /* Allocate response buffer */
     if ((resbuf = malloc(BUFSIZ)) == NULL) {
@@ -864,6 +873,38 @@ main(int argc, char *argv[])
     }
     res = res0;
 
+    /* setup connection before waiting for fifo */
+    setup_connection(res, &sd);
+
+    if (argc < 3) {
+        mylog(LOG_ALL, "[%d][%s] - interactive mode", __LINE__, __func__);
+        interactive = 1;
+
+        mkfifo(fifo_out_name, 0666);
+        mkfifo(fifo_in_name, 0666);
+        printf("########################## fifo open ... \n");
+        fifo_in_fd = open(fifo_in_name, O_RDONLY);
+        printf("########################## in ready ...\n");
+        fifo_out_fd = open(fifo_out_name, O_WRONLY);
+        printf("########################## out ready ...\n");
+
+    } else {
+        /* Parse requests by cmdline arguments and queue them */
+        for (i = 2; i < argc; i++) {
+            if ((request = malloc(sizeof(struct request))) == NULL) {
+                mylog(LOG_ERR, "[%d][%s] - malloc failed", __LINE__, __func__);
+                exit(EXIT_FAILURE);
+            }
+
+            request->url = argv[i];
+            mylog(LOG_INF, "[%d][%s] - queueing : %s", __LINE__, __func__, request->url);
+            TAILQ_INSERT_TAIL(&requests_open, request, entries);
+            num_req_open++;
+        }
+
+        mylog(LOG_INF, "[%d][%s] - %d requests open", __LINE__, __func__, num_req_open);
+    }
+
     /* Do the fetching */
     while (num_req_open > 0 || num_req_pending > 0 || interactive) {
 
@@ -880,6 +921,7 @@ main(int argc, char *argv[])
         /* Hook stdin in select if we are interactive */
         if (interactive) {
             FD_SET(STDIN_FILENO, &fdsetrecv);
+            FD_SET(fifo_in_fd, &fdsetrecv);
         }
 
         /* Bind sd to select functions - if we have requests open, hook for sending ... */
@@ -889,7 +931,7 @@ main(int argc, char *argv[])
         /* ... and always for receiving */
         FD_SET(sd, &fdsetrecv);
 
-        maxfd = MAX(STDIN_FILENO, sd) + 1;
+        maxfd = MAX(MAX(STDIN_FILENO, sd), fifo_in_fd) + 1;
 
         /* Select section - handle stdin and socket */
         if ((selectsock = select(maxfd, &fdsetrecv, &fdsetsend, NULL, NULL)) < 0) {
@@ -921,7 +963,41 @@ main(int argc, char *argv[])
 
                 mylog(LOG_INF, "[%d][%s] - queueing : %s", __LINE__, __func__, request->url);
             }
+            continue;
+        }
 
+        /* Ready to read a new request from FIFO */
+        if (FD_ISSET(fifo_in_fd, &fdsetrecv)) {
+            mylog(LOG_INF, "[%d][%s] - select for FIFO", __LINE__, __func__);
+
+            if ((request = malloc(sizeof(struct request))) == NULL) {
+                mylog(LOG_ERR, "[%d][%s] - malloc failed", __LINE__, __func__);
+                exit(EXIT_FAILURE);
+            }
+
+            if ((request->url = malloc(BUFSIZ)) == NULL) {
+                mylog(LOG_ERR, "[%d][%s] - malloc failed", __LINE__, __func__);
+                exit(EXIT_FAILURE);
+            }
+
+            if (read(fifo_in_fd, &(request->pipe_data), sizeof(struct sctp_pipe_data)) != sizeof(struct sctp_pipe_data)) {
+                mylog(LOG_ERR, "[%d][%s] - fifo read failed", __LINE__, __func__);
+                // felix refactoring!!
+                interactive = 0;
+                free(request->url);
+                free(request);
+                goto cleanupconn;
+            } else {
+                request->pipe_data.path[strcspn(request->pipe_data.path, "\n")] = 0;
+                printf("#####\n->%s<-\n#####", request->pipe_data.path);
+
+                snprintf(request->url, BUFSIZ, "%s", request->pipe_data.path);
+                TAILQ_INSERT_TAIL(&requests_open, request, entries);
+                num_req_open++;
+
+                mylog(LOG_INF, "[%d][%s] - queueing : %s", __LINE__, __func__, request->url);
+            }
+            continue;
         }
 
         /* Ready to recv from socket */
@@ -1016,7 +1092,7 @@ main(int argc, char *argv[])
 
         /* sending last request ... do we need to blocking-send a request? */
         //felix : num_req_open > 0 ?
-        if (num_req_pending == 0 && streamsbusy == 0) {
+        if (num_req_pending == 0 && num_req_open > 0 && streamsbusy == 0) {
             mylog(LOG_INF, "blocking send_request()");
             if (send_request(sd, reqbuf, &reqbuflen, &reqbufpos) == -1) {
                 mylog(LOG_ERR, "[%d][%s] - send_request() failed", __LINE__, __func__);
@@ -1055,10 +1131,15 @@ main(int argc, char *argv[])
             mylog(LOG_INF, "handling response for %s", request->url);
             if (handle_response(&sd, &fd, resbuf, &resbuflen, &resbufpos, &nres, request, &keepalive, &pipelined) == 0) {
                 TAILQ_REMOVE(&requests_pending, request, entries);
+
+                if (interactive) {
+                    free(request->url);
+                }
+
                 free(request);
 
                 /* We've finished this file! */
-                nres++;
+                num_req_finished++;
                 num_req_pending--;
                 streamstatus[lastStream] = STREAM_FREE;
                 /* at least one stream is free for a new request */
@@ -1136,6 +1217,12 @@ cleanupconn:
         resbufpos = 0;
         continue;
     }
+
+    mylog(LOG_ALL, "###### STATS ######\n");
+    mylog(LOG_ALL, "\trequests      : %d", num_req_finished);
+    mylog(LOG_ALL, "\tbytes header  : %d", bytes_header);
+    mylog(LOG_ALL, "\tbytes payload : %d", bytes_payload);
+
 
     free(resbuf);
     freeaddrinfo(res0);
