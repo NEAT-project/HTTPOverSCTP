@@ -72,9 +72,9 @@ static char *           env_HTTP_SCTP_UDP_ENCAPS_PORT;
 static char *           env_HTTP_DEBUG;
 
 static struct           timeval timo = {15, 0};
-static uint8_t          log_level = LOG_DBG;                          /* 0 = none | 1 = error | 2 = verbose | 3 = very verbose */
+static uint8_t          log_level = LOG_INF;                          /* 0 = none | 1 = error | 2 = verbose | 3 = very verbose */
 static in_port_t        udp_encaps_port = 0;
-static int              protocol = IPPROTO_TCP;
+static int              protocol = IPPROTO_SCTP;
 static uint8_t          streamstatus[NUM_SCTP_STREAMS];
 static uint32_t         lastStream = 0;                     /* Last SCTP stream read from */
 static char             *servername;                        /* Name of server to connect with */
@@ -755,14 +755,11 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
     }
 
     mylog(LOG_INF, "#####################");
-
-
     if (protocol == IPPROTO_SCTP) {
         mylog(LOG_ALL, "http://%s/%s - status: %d - req: %d - sctp sid: %d", servername, request->url, statuscode, *nres, lastStream);
     } else {
         mylog(LOG_ALL, "http://%s/%s - status: %d - req: %d", servername, request->url, statuscode, *nres);
     }
-
     mylog(LOG_INF, "\t HEADER   : %d", bytes_header - bytes_header_tmp);
     mylog(LOG_INF, "\t PAYLOAD  : %d", bytes_payload - bytes_payload_tmp);
     mylog(LOG_INF, "#####################");
@@ -988,6 +985,7 @@ main(int argc, char *argv[])
                     if (errno != EAGAIN && streamsbusy == 0) {
                         goto conndied;
                     }
+                    break;
                 } else {
                     free(reqbuf);
                     reqbuf = NULL;
@@ -1004,7 +1002,7 @@ main(int argc, char *argv[])
                     num_req_open--;
                     num_req_pending++;
 
-                    mylog(LOG_INF, "[%d][%s] - %s : open -> pending", __LINE__, __func__, request->url);
+                    mylog(LOG_INF, "[%d][%s] - %s : open -> pending (pipelined)", __LINE__, __func__, request->url);
                 }
             }
         }
@@ -1018,7 +1016,7 @@ main(int argc, char *argv[])
 
         /* sending last request ... do we need to blocking-send a request? */
         //felix : num_req_open > 0 ?
-        if (nreq == nres && streamsbusy == 0) {
+        if (num_req_pending == 0 && streamsbusy == 0) {
             mylog(LOG_INF, "blocking send_request()");
             if (send_request(sd, reqbuf, &reqbuflen, &reqbufpos) == -1) {
                 mylog(LOG_ERR, "[%d][%s] - send_request() failed", __LINE__, __func__);

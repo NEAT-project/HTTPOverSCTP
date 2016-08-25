@@ -8,7 +8,7 @@ else
 fi
 echo 'using' $HTTP_TRANSPORT_PROTOCOL
 
-$2 ./phttpget localhost \
+$2 ./phttpget bsd3.nplab.de  \
 chunks/chunk-0-0.jpg \
 chunks/chunk-0-1.jpg \
 chunks/chunk-0-2.jpg \
