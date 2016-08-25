@@ -52,9 +52,18 @@ __FBSDID("$FreeBSD: head/usr.sbin/portsnap/phttpget/phttpget.c 190679 2009-04-03
 #include <sysexits.h>
 #include <unistd.h>
 #include <sys/queue.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/time.h>
 
 /* maximum SCTP streams */
 #define NUM_SCTP_STREAMS    10
+
+#define LOG_ALL             0
+#define LOG_ERR             1
+#define LOG_INF             2
+#define LOG_DBG             3
 
 static const char *     env_HTTP_USER_AGENT;
 static char *           env_HTTP_TIMEOUT;
@@ -63,13 +72,16 @@ static char *           env_HTTP_SCTP_UDP_ENCAPS_PORT;
 static char *           env_HTTP_DEBUG;
 
 static struct           timeval timo = {15, 0};
-static uint8_t          debug = 0;                          /* 0 = none | 1 = verbose | 2 = very verbose */
+static uint8_t          log_level = LOG_DBG;                          /* 0 = none | 1 = error | 2 = verbose | 3 = very verbose */
 static in_port_t        udp_encaps_port = 0;
 static int              protocol = IPPROTO_TCP;
 static uint8_t          streamstatus[NUM_SCTP_STREAMS];
 static uint32_t         lastStream = 0;                     /* Last SCTP stream read from */
 static char             *servername;                        /* Name of server to connect with */
 static uint8_t          streamsbusy = 0;                    /* Indicator if all streams are busy */
+static struct timeval   tv_init;
+static uint32_t         bytes_header = 0;
+static uint32_t         bytes_payload = 0;
 
 enum stream_status {STREAM_FREE, STREAM_USED};
 
@@ -109,11 +121,60 @@ strnstr(const char *s, const char *find, size_t slen)
 }
 #endif
 
+/*
+ * Write log entry
+ */
+static void
+mylog(uint8_t level, const char* format, ...)
+{
+
+    struct timeval tv_now, tv_diff;
+    // skip unwanted loglevels
+    if (log_level < level) {
+        return;
+    }
+
+    gettimeofday(&tv_now, NULL);
+
+    tv_diff.tv_sec = tv_now.tv_sec - tv_init.tv_sec;
+
+    if (tv_init.tv_usec < tv_now.tv_usec) {
+        tv_diff.tv_usec = tv_now.tv_usec - tv_init.tv_usec;
+    } else {
+        tv_diff.tv_sec -= 1;
+        tv_diff.tv_usec = 1000000 + tv_now.tv_usec - tv_init.tv_usec;
+    }
+
+    fprintf(stderr, "[%4ld.%06ld]", (long)tv_diff.tv_sec, (long)tv_diff.tv_usec);
+
+    switch (level) {
+        case 0:
+            fprintf(stderr, "[ALL] ");
+            break;
+        case 1:
+            fprintf(stderr, "[ERR] ");
+            break;
+        case 2:
+            fprintf(stderr, "[INF] ");
+            break;
+        case 3:
+            fprintf(stderr, "[DBG] ");
+            break;
+    }
+
+    va_list argptr;
+    va_start(argptr, format);
+    vfprintf(stderr, format, argptr);
+    va_end(argptr);
+
+    fprintf(stderr, "\n"); // xxx:ugly solution...
+}
+
 /* Print usage and exit */
 static void
 usage(void)
 {
-    fprintf(stderr, "usage: phttpget server [file1 file2 filnen]\n");
+    mylog(LOG_ALL, "usage: phttpget server [file1 file2 filnen]\n");
     exit(EX_USAGE);
 }
 
@@ -134,7 +195,7 @@ readenv(void)
     if (env_HTTP_TIMEOUT != NULL) {
         http_timeout = strtol(env_HTTP_TIMEOUT, &p, 10);
         if ((*env_HTTP_TIMEOUT == '\0') || (*p != '\0') || (http_timeout < 0)) {
-            fprintf(stderr, "HTTP_TIMEOUT (%s) is not a positive integer\n", env_HTTP_TIMEOUT);
+            mylog(LOG_ERR, "HTTP_TIMEOUT (%s) is not a positive integer", env_HTTP_TIMEOUT);
         } else {
             timo.tv_sec = http_timeout;
         }
@@ -146,7 +207,7 @@ readenv(void)
         } else if (strncasecmp(env_HTTP_TRANSPORT_PROTOCOL, "SCTP", 4) == 0) {
             protocol = IPPROTO_SCTP;
         } else {
-            fprintf(stderr, "HTTP_TRANSPORT_PROTOCOL (%s) not supported\n", env_HTTP_TRANSPORT_PROTOCOL);
+            mylog(LOG_ERR, "HTTP_TRANSPORT_PROTOCOL (%s) not supported", env_HTTP_TRANSPORT_PROTOCOL);
         }
     }
 
@@ -154,19 +215,102 @@ readenv(void)
     if (env_HTTP_SCTP_UDP_ENCAPS_PORT != NULL) {
         port = strtol(env_HTTP_SCTP_UDP_ENCAPS_PORT, &p, 10);
         if ((*env_HTTP_SCTP_UDP_ENCAPS_PORT == '\0') || (*p != '\0') || (port < 0) || (port > 65535)) {
-            fprintf(stderr, "HTTP_SCTP_UDP_ENCAPS_PORT (%s) is not a valid port number\n", env_HTTP_SCTP_UDP_ENCAPS_PORT);
+            mylog(LOG_ERR, "HTTP_SCTP_UDP_ENCAPS_PORT (%s) is not a valid port number", env_HTTP_SCTP_UDP_ENCAPS_PORT);
         } else {
             udp_encaps_port = (in_port_t)port;
         }
     }
 
     env_HTTP_DEBUG = getenv("HTTP_DEBUG");
-    if (env_HTTP_DEBUG == NULL) {
-        debug = 1;
-    } else {
-        fprintf(stderr, "Debug output enabled...\n");
-        debug = 1;
+    if (env_HTTP_DEBUG != NULL) {
+        log_level = LOG_DBG;
+        mylog(LOG_INF, "Debug output enabled...\n");
     }
+}
+
+static int
+setup_connection(struct addrinfo *res, int *sd) {
+    int tempindex = 0;
+    struct sctp_initmsg initmsg;    /* To signal die number of incoming and outgoing streams */
+    int val;                        /* Value used for setsockopt call */
+#ifdef SCTP_REMOTE_UDP_ENCAPS_PORT
+    struct sctp_udpencaps encaps;   /* SCTP/UDP information */
+#endif
+
+
+    /* Initialize the stream status array */
+    for (tempindex = 0; tempindex < NUM_SCTP_STREAMS; tempindex++) {
+        streamstatus[tempindex] = STREAM_FREE;
+    }
+
+    /* No addresses left to try :-( */
+    if (res == NULL) {
+        mylog(LOG_ERR, "[%d][%s] - Could not connect to %s", __LINE__, __func__, servername);
+        exit(EXIT_FAILURE);
+    }
+
+    /* Create a socket... */
+    *sd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (*sd == -1) {
+        /* reatry... */
+        mylog(LOG_ERR, "[%d][%s] - socket() failed", __LINE__, __func__);
+        return -1;
+    }
+
+    /* ... set 15-second timeouts ... */
+    setsockopt(*sd, SOL_SOCKET, SO_SNDTIMEO, (void *)&timo, (socklen_t)sizeof(timo));
+    setsockopt(*sd, SOL_SOCKET, SO_RCVTIMEO, (void *)&timo, (socklen_t)sizeof(timo));
+
+    /* set SCTP specific options */
+    if (protocol == IPPROTO_SCTP) {
+        /* Ensure an appropriate number of stream will be negotated. */
+        initmsg.sinit_num_ostreams = NUM_SCTP_STREAMS;
+        initmsg.sinit_max_instreams = NUM_SCTP_STREAMS;
+        initmsg.sinit_max_attempts = 0;   /* Use default */
+        initmsg.sinit_max_init_timeo = 0; /* Use default */
+        if (setsockopt(*sd, IPPROTO_SCTP, SCTP_INITMSG, (char*) &initmsg, sizeof(initmsg) ) < 0 ) {
+            mylog(LOG_ERR, "[%d][%s] - setsockopt failed", __LINE__, __func__);
+            exit(EXIT_FAILURE);
+        }
+
+        /* Enable RCVINFO delivery */
+        val = 1;
+        if (setsockopt(*sd, IPPROTO_SCTP, SCTP_RECVRCVINFO, (char*) &val, sizeof(val) ) < 0 ) {
+            mylog(LOG_ERR, "[%d][%s] - setsockopt failed", __LINE__, __func__);
+            exit(EXIT_FAILURE);
+        }
+
+#ifdef SCTP_REMOTE_UDP_ENCAPS_PORT
+        /* Use UDP encapsulation for SCTP */
+        memset(&encaps, 0, sizeof(encaps));
+        encaps.sue_address.ss_family = res->ai_family;
+        encaps.sue_address.ss_len = res->ai_addrlen;
+        encaps.sue_port = htons(udp_encaps_port);
+        setsockopt(*sd, IPPROTO_SCTP, SCTP_REMOTE_UDP_ENCAPS_PORT, (void *)&encaps, (socklen_t)sizeof(encaps));
+#else
+        if (udp_encaps_port > 0) {
+            mylog(LOG_ERR, "[%d][%s] - UDP encapsulation unsupported", __LINE__, __func__);
+            exit(EXIT_FAILURE);
+        }
+#endif
+    }
+
+#ifdef SO_NOSIGPIPE
+    /* ... disable SIGPIPE generation ... */
+    val = 1;
+    setsockopt(*sd, SOL_SOCKET, SO_NOSIGPIPE, (void *)&val, sizeof(int));
+#endif
+
+    /* ... and connect to the server. */
+    if (connect(*sd, res->ai_addr, res->ai_addrlen)) {
+        close(*sd);
+        *sd = -1;
+        mylog(LOG_ERR, "[%d][%s] - connect() failed", __LINE__, __func__);
+        return -1;
+    }
+
+    mylog(LOG_ERR, "[%d][%s] - connected", __LINE__, __func__);
+    return 0;
 }
 
 static int
@@ -190,7 +334,7 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
 
         /* If the buffer is full, complain */
         if (*resbuflen == BUFSIZ) {
-            fprintf(stderr, "[%d][%s] - buffer is full\n", __LINE__, __func__);
+            mylog(LOG_INF, "[%d][%s] - buffer is full", __LINE__, __func__);
             return -1;
         }
 
@@ -213,7 +357,7 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
 
         /* If recvmsg returned 0 or -1 (no interrupt) - we stop reading */
         if ((len == 0) || ((len == -1) && (errno != EINTR))) {
-            fprintf(stderr, "[%d][%s] - recvmsg returned 0 or -1\n", __LINE__, __func__);
+            mylog(LOG_ERR, "[%d][%s] - recvmsg returned 0 or -1", __LINE__, __func__);
             return -1;
         } else if (len > 0) {
             *resbuflen += len;
@@ -236,7 +380,6 @@ copybytes(int sd, int fd, off_t copylen, char *resbuf, int *resbuflen, int *resb
     memset(cmsgbuf, 0, CMSG_SPACE(sizeof(struct sctp_rcvinfo)));
 
     while (copylen) {
-
         /* Write data from resbuf to fd */
         len = *resbuflen - *resbufpos;
         if (copylen < len) {
@@ -245,18 +388,18 @@ copybytes(int sd, int fd, off_t copylen, char *resbuf, int *resbuflen, int *resb
 
         /* Write to file until resbuf is "empty" before calling recvmsg */
         if (len > 0) {
+            /* fd is unset so we just discard data */
             if (fd == -1) {
-                fprintf(stderr, "[%d][%s] - write() failed - fd == -1\n", __LINE__, __func__);
-                exit(EXIT_FAILURE);
-            }
-
-            if ((len = write(fd, resbuf + *resbufpos, len)) == -1) {
-                fprintf(stderr, "[%d][%s] - write() failed\n", __LINE__, __func__);
+                mylog(LOG_INF, "[%d][%s] - fd == -1 - discarding", __LINE__, __func__);
+            /* we have valid fd - so write to file */
+            } else if ((len = write(fd, resbuf + *resbufpos, len)) == -1) {
+                mylog(LOG_ALL, "[%d][%s] - write() failed - fix it!", __LINE__, __func__);
                 exit(EXIT_FAILURE);
             }
 
             *resbufpos += len;
             copylen -= len;
+            bytes_payload += len;
             continue;
         }
 
@@ -275,11 +418,13 @@ copybytes(int sd, int fd, off_t copylen, char *resbuf, int *resbuflen, int *resb
             if (errno == EINTR) {
                 continue;
             }
-            fprintf(stderr, "[%d][%s] - recvmsg() failed\n", __LINE__, __func__);
+            mylog(LOG_ERR, "[%d][%s] - recvmsg() failed : %s", __LINE__, __func__, strerror(errno));
             return -1;
         } else if (len == 0) {
+            mylog(LOG_ERR, "[%d][%s] - recvmsg() returned 0", __LINE__, __func__);
             return -2;
         } else {
+            mylog(LOG_ERR, "[%d][%s] - read %d bytes ", __LINE__, __func__, len);
             *resbuflen = len;
             *resbufpos = 0;
             if (protocol == IPPROTO_SCTP) {
@@ -309,6 +454,8 @@ send_request(int sd,  char *reqbuf, int *reqbuflen, int *reqbufpos) {
     msghdr.msg_iov = &iov;
     msghdr.msg_iovlen = 1;
 
+    mylog(LOG_INF, "[%d][%s] - %s", __LINE__, __func__, reqbuf + *reqbufpos);
+
     /* if using SCTP, append control msg to define outgoing stream */
     if (protocol == IPPROTO_SCTP) {
         msghdr.msg_control = cmsgbuf;
@@ -332,7 +479,7 @@ send_request(int sd,  char *reqbuf, int *reqbuflen, int *reqbufpos) {
         }
 
         if (streamsbusy == 1) {
-            fprintf(stderr, "[%d][%s] - all SCTP streams are busy...\n", __LINE__, __func__);
+            mylog(LOG_ERR, "[%d][%s] - all SCTP streams are busy...", __LINE__, __func__);
             return -2;
         }
     }
@@ -343,7 +490,7 @@ send_request(int sd,  char *reqbuf, int *reqbuflen, int *reqbufpos) {
         iov.iov_len = *reqbuflen - *reqbufpos;
 
         if ((len = sendmsg(sd, &msghdr, 0)) < 0) {
-            fprintf(stderr, "[%d][%s] - sendmsg() failed...\n", __LINE__, __func__);
+            mylog(LOG_ERR, "[%d][%s] - sendmsg() failed...", __LINE__, __func__);
             break;
         }
 
@@ -360,22 +507,20 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
     int error = 0;
     char * hln;                 /* Pointer within header line */
     char * eolp;                /* Pointer to "\r\n" within resbuf */
-    int statuscode;             /* HTTP Status code */
-    off_t contentlength;        /* Value from Content-Length header */
-    int chunked;                /* != if transfer-encoding is chunked */
+    int statuscode = 0;             /* HTTP Status code */
+    off_t contentlength = -1;        /* Value from Content-Length header */
+    int chunked = 0;                /* != if transfer-encoding is chunked */
     off_t clen;                 /* Chunk length */
     char * fname = NULL;        /* Name of downloaded file */
+    uint32_t bytes_header_tmp = bytes_header;
+    uint32_t bytes_payload_tmp = bytes_payload;
 
-    statuscode = 0;
-    contentlength = -1;
-    chunked = 0;
     *keepalive = 0;
-
 
     do {
         /* Get a header line */
         if (readln(*sd, resbuf, resbuflen, resbufpos)) {
-            fprintf(stderr, "[%d][%s] - readln() failed\n", __LINE__, __func__);
+            mylog(LOG_ERR, "[%d][%s] - readln() failed", __LINE__, __func__);
             return -1;
         }
 
@@ -383,6 +528,10 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
         eolp = strnstr(hln, "\r\n", *resbuflen - *resbufpos);
         *resbufpos = (eolp - resbuf) + 2;
         *eolp = '\0';
+
+        bytes_header += strlen(hln);
+
+        mylog(LOG_INF, "[%d][%s] - %s", __LINE__, __func__, hln);
 
         /* Make sure it doesn't contain a NUL character */
         if (strchr(hln, '\0') != eolp) {
@@ -441,9 +590,7 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
                 *keepalive = 1;
             }
 
-            if (debug) {
-                fprintf(stderr, "[%d][%s] - Keep-Alive : %d - Pipelined : %d\n", __LINE__, __func__, *keepalive, *pipelined);
-            }
+            mylog(LOG_INF, "[%d][%s] - Keep-Alive : %d - Pipelined : %d", __LINE__, __func__, *keepalive, *pipelined);
 
             /* Next header... */
             continue;
@@ -524,17 +671,16 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
         }
 
         if (strlen(fname) == 0) {
-            fprintf(stderr, "[%d][%s] - Cannot optain file name\n", __LINE__, __func__);
+            mylog(LOG_ERR, "[%d][%s] - Cannot optain file name", __LINE__, __func__);
             exit(EXIT_FAILURE);
         }
 
         /* Open file for writing */
         if ((*fd = open(fname, O_CREAT | O_TRUNC | O_WRONLY, 0644)) == -1) {
-            fprintf(stderr, "[%d][%s] - Failed to open file for writing\n", __LINE__, __func__);
+            mylog(LOG_ERR, "[%d][%s] - Failed to open file for writing", __LINE__, __func__);
             exit(EXIT_FAILURE);
         }
     };
-
     /* Read the message and send data to fd if appropriate */
     if (chunked) {
         /* Handle a chunked-encoded entity */
@@ -564,13 +710,12 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
                 hln++;
             }
 
-            error = copybytes(*sd, *fd, clen, resbuf, resbuflen, resbufpos);
-            if (error) {
+            if (copybytes(*sd, *fd, clen, resbuf, resbuflen, resbufpos)) {
+                mylog(LOG_ERR, "[%d][%s] - copybytes failed", __LINE__, __func__);
+                *keepalive = 0;
                 return -1;
             }
         } while (clen != 0);
-
-
 
         /* Read trailer and final CRLF */
         do {
@@ -583,10 +728,10 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
             *resbufpos = (eolp - resbuf) + 2;
         } while (hln != eolp);
     } else if (contentlength != -1) {
-        error = copybytes(*sd, *fd, contentlength, resbuf, resbuflen, resbufpos);
-        if (error) {
-            fprintf(stderr, "[%d][%s] - copybytes failed\n", __LINE__, __func__);
-            return -1;
+        if (copybytes(*sd, *fd, contentlength, resbuf, resbuflen, resbufpos)) {
+            mylog(LOG_ERR, "[%d][%s] - copybytes failed", __LINE__, __func__);
+            *keepalive = 0;
+            //return -1;
         }
     } else {
 
@@ -595,33 +740,32 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
          * Read everything until the server closes the
          * socket.
          */
-        error = copybytes(*sd, *fd, OFF_MAX, resbuf, resbuflen, resbufpos);
-        if (error == -1) {
-            fprintf(stderr, "[%d][%s] - copybytes failed\n", __LINE__, __func__);
-            return -1;
+        if (copybytes(*sd, *fd, OFF_MAX, resbuf, resbuflen, resbufpos)) {
+            mylog(LOG_ERR, "[%d][%s] - copybytes failed", __LINE__, __func__);
+            *keepalive = 0;
+            //return -1;
         }
         *pipelined = 0;
     }
+
 
     if (*fd != -1) {
         close(*fd);
         *fd = -1;
     }
 
-    fprintf(stderr, "http://%s/%s - %d - %d - ", servername, request->url, statuscode, *nres);
+    mylog(LOG_INF, "#####################");
+
 
     if (protocol == IPPROTO_SCTP) {
-        fprintf(stderr, "SCTP Stream %d - ", lastStream);
+        mylog(LOG_ALL, "http://%s/%s - status: %d - req: %d - sctp sid: %d", servername, request->url, statuscode, *nres, lastStream);
+    } else {
+        mylog(LOG_ALL, "http://%s/%s - status: %d - req: %d", servername, request->url, statuscode, *nres);
     }
 
-    if (statuscode == 200)
-        fprintf(stderr, "OK\n");
-    else if (statuscode < 300)
-        fprintf(stderr, "Successful (ignored)\n");
-    else if (statuscode < 400)
-        fprintf(stderr, "Redirection (ignored)\n");
-    else
-        fprintf(stderr, "Error (ignored)\n");
+    mylog(LOG_INF, "\t HEADER   : %d", bytes_header - bytes_header_tmp);
+    mylog(LOG_INF, "\t PAYLOAD  : %d", bytes_payload - bytes_payload_tmp);
+    mylog(LOG_INF, "#####################");
 
     return 0;
 }
@@ -633,9 +777,6 @@ main(int argc, char *argv[])
     struct addrinfo hints;          /* Hints to getaddrinfo */
     struct addrinfo *res;           /* Pointer to server address being used */
     struct addrinfo *res0;          /* Pointer to server addresses */
-#ifdef SCTP_REMOTE_UDP_ENCAPS_PORT
-    struct sctp_udpencaps encaps;   /* SCTP/UDP information */
-#endif
     char * reqbuf = NULL;           /* Request buffer */
     int reqbufpos = 0;              /* Request buffer position */
     int reqbuflen = 0;              /* Request buffer length */
@@ -647,17 +788,15 @@ main(int argc, char *argv[])
     int error;                      /* Error code */
     int i = 0;                      /* For loop iterator */
     int firstreq = 0;               /* # of first request for this connection */
-    int val;                        /* Value used for setsockopt call */
-    struct sctp_initmsg initmsg;    /* To signal die number of incoming and outgoing streams */
-    int tempindex = 0;              /* Variable for loops */
     char *resbuf = NULL;            /* Response buffer */
     int resbuflen = 0;              /* Length of the receiver buffer */
     int keepalive = 0;              /* Keep-Alive indicator */
-    int fd = 0;                     /* Filedescriptor (file) */
+    int fd = -1;                     /* Filedescriptor (file) */
     struct request *request;        /* Request from open or pending queue */
     int resbufpos = 0;              /* Response buffer position */
     int num_req_open = 0;
     int num_req_pending = 0;
+    //int num_req_finished = 0;
     struct fd_set fdsetrecv;
     struct fd_set fdsetsend;
     int interactive = 0;
@@ -668,10 +807,8 @@ main(int argc, char *argv[])
     TAILQ_INIT(&requests_open);
     TAILQ_INIT(&requests_pending);
 
-    /* Initialize the stream status array */
-    for (tempindex = 0; tempindex < NUM_SCTP_STREAMS; tempindex++) {
-        streamstatus[tempindex] = STREAM_FREE;
-    }
+    gettimeofday(&tv_init, NULL);
+
 
     /* Check that the arguments are sensible */
     if (argc < 2) {
@@ -683,33 +820,30 @@ main(int argc, char *argv[])
 
     /* Get server name and adjust arg[cv] to point at file names */
     servername = argv[1];
-    argv += 2;
-    argc -= 2;
 
-
-    if (argc < 1) {
-        fprintf(stderr, "[%d][%s] - interactive mode\n", __LINE__, __func__);
+    if (argc < 3) {
+        mylog(LOG_ALL, "[%d][%s] - interactive mode", __LINE__, __func__);
         interactive = 1;
-    }
+    } else {
+        /* Parse requests by cmdline arguments and queue them */
+        for (i = 2; i < argc; i++) {
+            if ((request = malloc(sizeof(struct request))) == NULL) {
+                mylog(LOG_ERR, "[%d][%s] - malloc failed", __LINE__, __func__);
+                exit(EXIT_FAILURE);
+            }
 
-    /* Parse requests by cmdline arguments and queue them */
-    for (i = 0; i < argc; i++) {
-        if ((request = malloc(sizeof(struct request))) == NULL) {
-            fprintf(stderr, "[%d][%s] - malloc failed\n", __LINE__, __func__);
-            exit(EXIT_FAILURE);
+            request->url = argv[i];
+            mylog(LOG_INF, "[%d][%s] - queueing : %s", __LINE__, __func__, request->url);
+            TAILQ_INSERT_TAIL(&requests_open, request, entries);
+            num_req_open++;
         }
 
-        request->url = argv[i];
-        fprintf(stderr, "[%d][%s] - queueing : %s\n", __LINE__, __func__, request->url);
-        TAILQ_INSERT_TAIL(&requests_open, request, entries);
-        num_req_open++;
+        mylog(LOG_INF, "[%d][%s] - %d requests open", __LINE__, __func__, num_req_open);
     }
-
-    fprintf(stderr, "[%d][%s] - %d requests open\n", __LINE__, __func__, num_req_open);
 
     /* Allocate response buffer */
     if ((resbuf = malloc(BUFSIZ)) == NULL) {
-        fprintf(stderr, "[%d][%s] - malloc failed\n", __LINE__, __func__);
+        mylog(LOG_ERR, "[%d][%s] - malloc failed", __LINE__, __func__);
     }
 
     /* Server lookup */
@@ -724,11 +858,11 @@ main(int argc, char *argv[])
     error = getaddrinfo(servername, "80", &hints, &res0);
 #endif
     if (error) {
-        fprintf(stderr, "[%d][%s] - host = %s, port = %s: %s\n", __LINE__, __func__, servername, "http", gai_strerror(error));
+        mylog(LOG_ERR, "[%d][%s] - host = %s, port = %s: %s", __LINE__, __func__, servername, "http", gai_strerror(error));
         exit(EXIT_FAILURE);
     }
     if (res0 == NULL) {
-        fprintf(stderr, "[%d][%s] - lookup for %s failed\n", __LINE__, __func__, servername);
+        mylog(LOG_ERR, "[%d][%s] - lookup for %s failed", __LINE__, __func__, servername);
         exit(EXIT_FAILURE);
     }
     res = res0;
@@ -738,75 +872,7 @@ main(int argc, char *argv[])
 
         /* Make sure we have a connected socket */
         for (; sd == -1; res = res->ai_next) {
-            /* No addresses left to try :-( */
-            if (res == NULL) {
-                fprintf(stderr, "[%d][%s] - Could not connect to %s\n", __LINE__, __func__, servername);
-                exit(EXIT_FAILURE);
-            }
-
-            /* Create a socket... */
-            sd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-            if (sd == -1) {
-                /* reatry... */
-                continue;
-            }
-
-            /* ... set 15-second timeouts ... */
-            setsockopt(sd, SOL_SOCKET, SO_SNDTIMEO, (void *)&timo, (socklen_t)sizeof(timo));
-            setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, (void *)&timo, (socklen_t)sizeof(timo));
-
-            /* set SCTP specific options */
-            if (protocol == IPPROTO_SCTP) {
-                /* Ensure an appropriate number of stream will be negotated. */
-                initmsg.sinit_num_ostreams = NUM_SCTP_STREAMS;
-                initmsg.sinit_max_instreams = NUM_SCTP_STREAMS;
-                initmsg.sinit_max_attempts = 0;   /* Use default */
-                initmsg.sinit_max_init_timeo = 0; /* Use default */
-                if (setsockopt(sd, IPPROTO_SCTP, SCTP_INITMSG, (char*) &initmsg, sizeof(initmsg) ) < 0 ) {
-                    fprintf(stderr, "[%d][%s] - setsockopt failed\n", __LINE__, __func__);
-                    exit(EXIT_FAILURE);
-                }
-
-                /* Enable RCVINFO delivery */
-                val = 1;
-                if (setsockopt(sd, IPPROTO_SCTP, SCTP_RECVRCVINFO, (char*) &val, sizeof(val) ) < 0 ) {
-                    fprintf(stderr, "[%d][%s] - setsockopt failed\n", __LINE__, __func__);
-                    exit(EXIT_FAILURE);
-                }
-
-#ifdef SCTP_REMOTE_UDP_ENCAPS_PORT
-                /* Use UDP encapsulation for SCTP */
-                memset(&encaps, 0, sizeof(encaps));
-                encaps.sue_address.ss_family = res->ai_family;
-                encaps.sue_address.ss_len = res->ai_addrlen;
-                encaps.sue_port = htons(udp_encaps_port);
-                setsockopt(sd, IPPROTO_SCTP, SCTP_REMOTE_UDP_ENCAPS_PORT, (void *)&encaps, (socklen_t)sizeof(encaps));
-#else
-                if (udp_encaps_port > 0) {
-                    fprintf(stderr, "[%d][%s] - UDP encapsulation unsupported\n", __LINE__, __func__);
-                    exit(EXIT_FAILURE);
-                }
-#endif
-            }
-
-#ifdef SO_NOSIGPIPE
-            /* ... disable SIGPIPE generation ... */
-            val = 1;
-            setsockopt(sd, SOL_SOCKET, SO_NOSIGPIPE, (void *)&val, sizeof(int));
-#endif
-
-            /* ... and connect to the server. */
-            if (connect(sd, res->ai_addr, res->ai_addrlen)) {
-                close(sd);
-                sd = -1;
-                continue;
-            }
-
-            if (debug) {
-                fprintf(stderr, "[%d][%s] - connected\n", __LINE__, __func__);
-            }
-
-            //felix - why?!
+            setup_connection(res, &sd);
             firstreq = nres;
         }
 
@@ -830,51 +896,45 @@ main(int argc, char *argv[])
 
         /* Select section - handle stdin and socket */
         if ((selectsock = select(maxfd, &fdsetrecv, &fdsetsend, NULL, NULL)) < 0) {
-            fprintf(stderr, "[%d][%s] - select failed\n", __LINE__, __func__);
+            mylog(LOG_ERR, "[%d][%s] - select failed", __LINE__, __func__);
             exit(EXIT_FAILURE);
         }
 
         /* Ready to read a new request from stdin */
         if (FD_ISSET(STDIN_FILENO, &fdsetrecv)) {
-            if (debug) {
-                fprintf(stderr, "[%d][%s] - select for STDIN\n", __LINE__, __func__);
-            }
+            mylog(LOG_INF, "[%d][%s] - select for STDIN", __LINE__, __func__);
+
             if ((request = malloc(sizeof(struct request))) == NULL) {
-                fprintf(stderr, "[%d][%s] - malloc failed\n", __LINE__, __func__);
+                mylog(LOG_ERR, "[%d][%s] - malloc failed", __LINE__, __func__);
                 exit(EXIT_FAILURE);
             }
 
             if ((request->url = malloc(BUFSIZ)) == NULL) {
-                fprintf(stderr, "[%d][%s] - malloc failed\n", __LINE__, __func__);
+                mylog(LOG_ERR, "[%d][%s] - malloc failed", __LINE__, __func__);
                 exit(EXIT_FAILURE);
             }
 
             if (fgets(request->url, BUFSIZ, stdin) == NULL) {
-                fprintf(stderr, "[%d][%s] - fgets failed\n", __LINE__, __func__);
+                mylog(LOG_ERR, "[%d][%s] - fgets failed", __LINE__, __func__);
                 exit(EXIT_FAILURE);
             } else {
                 request->url[strcspn(request->url, "\n")] = 0;
                 TAILQ_INSERT_TAIL(&requests_open, request, entries);
                 num_req_open++;
-                if (debug) {
-                    fprintf(stderr, "[%d][%s] - queueing : %s\n", __LINE__, __func__, request->url);
-                }
+
+                mylog(LOG_INF, "[%d][%s] - queueing : %s", __LINE__, __func__, request->url);
             }
-        /* Ready to recv from socket */
+
         }
 
+        /* Ready to recv from socket */
         if (FD_ISSET(sd, &fdsetrecv)) {
-            if (debug) {
-                fprintf(stderr, "[%d][%s] - select for sd recv\n", __LINE__, __func__);
-            }
+            mylog(LOG_INF, "[%d][%s] - select for sd recv", __LINE__, __func__);
+        }
 
         /* Ready to send from socket */
-        }
-
         if (FD_ISSET(sd, &fdsetsend)) {
-            if (debug) {
-                fprintf(stderr, "[%d][%s] - select for sd send\n", __LINE__, __func__);
-            }
+            mylog(LOG_INF, "[%d][%s] - select for sd send", __LINE__, __func__);
         }
 
         /*
@@ -885,7 +945,7 @@ main(int argc, char *argv[])
         if (pipelined) {
             sdflags = fcntl(sd, F_GETFL);
             if (fcntl(sd, F_SETFL, sdflags | O_NONBLOCK) == -1) {
-                fprintf(stderr, "[%d][%s] - fcntl failed\n", __LINE__, __func__);
+                mylog(LOG_ERR, "[%d][%s] - fcntl failed", __LINE__, __func__);
                 exit(EXIT_FAILURE);
             }
         }
@@ -896,7 +956,7 @@ main(int argc, char *argv[])
             /* If not in the middle of a request, make one */
             if (reqbuf == NULL) {
                 if ((request = TAILQ_FIRST(&requests_open)) == NULL) {
-                    fprintf(stderr, "[%d][%s] - no open requests left... fix it!\n", __LINE__, __func__);
+                    mylog(LOG_ERR, "[%d][%s] - no open requests left... fix it!", __LINE__, __func__);
                     exit(EXIT_FAILURE);
                 }
 
@@ -909,7 +969,7 @@ main(int argc, char *argv[])
                     request->url, servername, env_HTTP_USER_AGENT,
                     (num_req_open == 1 && !interactive) ? "Connection: Close\r\n" : "Connection: Keep-Alive\r\n"
                 )) == -1) {
-                    fprintf(stderr, "[%d][%s] - asprintf failed\n", __LINE__, __func__);
+                    mylog(LOG_ERR, "[%d][%s] - asprintf failed", __LINE__, __func__);
                     exit(EXIT_FAILURE);
                 }
 
@@ -919,23 +979,22 @@ main(int argc, char *argv[])
             /* If in pipelined mode, try to send the request */
             if (pipelined && streamsbusy == 0) {
                 if (send_request(sd, reqbuf, &reqbuflen, &reqbufpos) == -1) {
-                    fprintf(stderr, "[%d][%s] - send_request() failed\n", __LINE__, __func__);
+                    mylog(LOG_ERR, "[%d][%s] - send_request() failed", __LINE__, __func__);
                     goto conndied; //handle more precisely...
                 }
 
                 if (reqbufpos < reqbuflen) {
-                    fprintf(stderr, "[%d][%s] - reqbufpos < reqbuflen or all streams busy...\n", __LINE__, __func__);
+                    mylog(LOG_ERR, "[%d][%s] - reqbufpos < reqbuflen or all streams busy...", __LINE__, __func__);
                     if (errno != EAGAIN && streamsbusy == 0) {
                         goto conndied;
                     }
-                    break;
                 } else {
                     free(reqbuf);
                     reqbuf = NULL;
 
                     /* move queue element from open to pending */
                     if ((request = TAILQ_FIRST(&requests_open)) == NULL) {
-                        fprintf(stderr, "[%d][%s] - this should not happen... dafuq!?\n", __LINE__, __func__);
+                        mylog(LOG_ALL, "[%d][%s] - this should not happen... dafuq!?", __LINE__, __func__);
                         exit(EXIT_FAILURE);
                     }
                     TAILQ_REMOVE(&requests_open, request, entries);
@@ -945,7 +1004,7 @@ main(int argc, char *argv[])
                     num_req_open--;
                     num_req_pending++;
 
-                    fprintf(stderr, "[%d][%s] - %s : open -> pending\n", __LINE__, __func__, request->url);
+                    mylog(LOG_INF, "[%d][%s] - %s : open -> pending", __LINE__, __func__, request->url);
                 }
             }
         }
@@ -953,32 +1012,31 @@ main(int argc, char *argv[])
         /* Put connection back into blocking mode */
         if (pipelined) {
             if (fcntl(sd, F_SETFL, sdflags) == -1) {
-                fprintf(stderr, "[%d][%s] - fcntl : non-blocking -> blocking failed (non-blocking part)\n", __LINE__, __func__);
+                mylog(LOG_ERR, "[%d][%s] - fcntl : non-blocking -> blocking failed (non-blocking part)", __LINE__, __func__);
             }
         }
 
         /* sending last request ... do we need to blocking-send a request? */
         //felix : num_req_open > 0 ?
         if (nreq == nres && streamsbusy == 0) {
-            printf("blocking send_request()\n");
+            mylog(LOG_INF, "blocking send_request()");
             if (send_request(sd, reqbuf, &reqbuflen, &reqbufpos) == -1) {
-                fprintf(stderr, "[%d][%s] - send_request() failed\n", __LINE__, __func__);
+                mylog(LOG_ERR, "[%d][%s] - send_request() failed", __LINE__, __func__);
                 goto conndied; //handle more precisely...
             }
 
             if (reqbufpos < reqbuflen) {
-                fprintf(stderr, "[%d][%s] - reqbufpos < reqbuflen or all streams busy...\n", __LINE__, __func__);
+                mylog(LOG_ERR, "[%d][%s] - reqbufpos < reqbuflen or all streams busy...", __LINE__, __func__);
                 if (errno != EAGAIN && streamsbusy == 0) {
                     goto conndied;
                 }
-                break;
             } else {
                 free(reqbuf);
                 reqbuf = NULL;
 
                 /* move queue element from open to pending */
                 if ((request = TAILQ_FIRST(&requests_open)) == NULL) {
-                    fprintf(stderr, "[%d][%s] - this should not happen... dafuq?!\n", __LINE__, __func__);
+                    mylog(LOG_ALL, "[%d][%s] - this should not happen... dafuq?!", __LINE__, __func__);
                     exit(EXIT_FAILURE);
                 }
                 TAILQ_REMOVE(&requests_open, request, entries);
@@ -987,7 +1045,7 @@ main(int argc, char *argv[])
                 nreq++;
                 num_req_open--;
                 num_req_pending++;
-                fprintf(stderr, "[%d][%s] - %s : open -> pending (blocking part)\n", __LINE__, __func__, request->url);
+                mylog(LOG_INF, "[%d][%s] - %s : open -> pending (blocking part)", __LINE__, __func__, request->url);
             }
         }
 
@@ -996,7 +1054,7 @@ main(int argc, char *argv[])
         /* take head element from pending queue */
         if ((request = TAILQ_FIRST(&requests_pending)) != NULL) {
             /* handle_response succeeded - remove pending element from queue */
-            fprintf(stderr, "handling response for %s \n", request->url);
+            mylog(LOG_INF, "handling response for %s", request->url);
             if (handle_response(&sd, &fd, resbuf, &resbuflen, &resbufpos, &nres, request, &keepalive, &pipelined) == 0) {
                 TAILQ_REMOVE(&requests_pending, request, entries);
                 free(request);
@@ -1010,8 +1068,8 @@ main(int argc, char *argv[])
             }
 
         } else if (request == NULL) {
-            fprintf(stderr, "[%d][%s] - no pending request left... fix logic!\n", __LINE__, __func__);
-            //exit(EXIT_FAILURE);
+            mylog(LOG_ALL, "[%d][%s] - no pending request left... fix logic!", __LINE__, __func__);
+            exit(EXIT_FAILURE);
             goto cleanupconn;
         }
 
@@ -1035,7 +1093,7 @@ conndied:
          */
 
         if (nres == firstreq) {
-            fprintf(stderr, "[%d][%s] - connection failure\n", __LINE__, __func__);
+            mylog(LOG_ALL, "[%d][%s] - connection failure", __LINE__, __func__);
             exit(EXIT_FAILURE);
         }
 
@@ -1043,9 +1101,8 @@ cleanupconn:
         /*
          * Clean up our connection and keep on going
          */
-        if (debug) {
-            fprintf(stderr, "[%d][%s] - cleanupconn\n", __LINE__, __func__);
-        }
+
+        mylog(LOG_INF, "[%d][%s] - cleanupconn", __LINE__, __func__);
         shutdown(sd, SHUT_RDWR);
         close(sd);
         sd = -1;
@@ -1059,18 +1116,19 @@ cleanupconn:
         }
         nreq = nres; // we did'nt sent all nres..
 
-        while(num_req_pending > 0) {
+        /* requeue all pending requests */
+        while (num_req_pending > 0) {
             /* pending requests have to be resent */
             if ((request = TAILQ_LAST(&requests_pending, request_queue)) == NULL) {
-                fprintf(stderr, "[%d][%s] - this should not happen\n", __LINE__, __func__);
-                //exit(EXIT_FAILURE);
+                mylog(LOG_ALL, "[%d][%s] - this should not happen ... fix", __LINE__, __func__);
+                exit(EXIT_FAILURE);
             }
             TAILQ_REMOVE(&requests_pending, request, entries);
             TAILQ_INSERT_HEAD(&requests_open, request, entries);
             num_req_open++;
             num_req_pending--;
 
-            fprintf(stderr, "[%d][%s] - %s : pending -> open\n", __LINE__, __func__, request->url);
+            mylog(LOG_INF, "[%d][%s] - %s : pending -> open", __LINE__, __func__, request->url);
         }
 
 
