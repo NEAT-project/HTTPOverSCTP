@@ -73,11 +73,12 @@ static char *           env_HTTP_TIMEOUT;
 static char *           env_HTTP_TRANSPORT_PROTOCOL;
 static char *           env_HTTP_SCTP_UDP_ENCAPS_PORT;
 static char *           env_HTTP_DEBUG;
+static char *           env_HTTP_PIPE;
 
 static struct           timeval timo = {15, 0};
-static uint8_t          log_level = LOG_INF;                          /* 0 = none | 1 = error | 2 = verbose | 3 = very verbose */
+static uint8_t          log_level = LOG_ALL;                /* 0 = none | 1 = error | 2 = verbose | 3 = very verbose */
 static in_port_t        udp_encaps_port = 0;
-static int              protocol = IPPROTO_TCP;
+static int              protocol = IPPROTO_SCTP;
 static uint8_t          streamstatus[NUM_SCTP_STREAMS];
 static uint32_t         lastStream = 0;                     /* Last SCTP stream read from */
 static char             *servername;                        /* Name of server to connect with */
@@ -86,13 +87,14 @@ static struct timeval   tv_init;
 static uint32_t         bytes_header = 0;
 static uint32_t         bytes_payload = 0;
 static uint8_t          interactive = 0;
+static uint8_t          use_pipe = 0;
 static uint8_t          save_file = 0;                      /* save received data to file */
 
 
-int fifo_in_fd = 0;
-int fifo_out_fd = 0;
-char *fifo_in_name = "/tmp/felixa";
-char *fifo_out_name = "/tmp/felixb";
+int fifo_in_fd = -1;
+int fifo_out_fd = -1;
+char *fifo_in_name = "/tmp/phttpget-in";
+char *fifo_out_name = "/tmp/phttpget-out";
 
 enum stream_status {STREAM_FREE, STREAM_USED};
 
@@ -244,7 +246,13 @@ readenv(void)
     env_HTTP_DEBUG = getenv("HTTP_DEBUG");
     if (env_HTTP_DEBUG != NULL) {
         log_level = LOG_DBG;
-        mylog(LOG_INF, "Debug output enabled...\n");
+        mylog(LOG_INF, "Debug output enabled...");
+    }
+
+    env_HTTP_PIPE = getenv("HTTP_PIPE");
+    if (env_HTTP_PIPE != NULL) {
+        use_pipe = 1;
+        mylog(LOG_INF, "Using pipes for requests/reposnses");
     }
 }
 
@@ -523,14 +531,14 @@ send_request(int sd,  char *reqbuf, int *reqbuflen, int *reqbufpos) {
 }
 
 static int
-handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, int *nres, struct request *request, int *keepalive, int *pipelined)
+handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, struct request *request, int *keepalive, int *pipelined)
 {
     int error = 0;
     char * hln;                 /* Pointer within header line */
     char * eolp;                /* Pointer to "\r\n" within resbuf */
-    int statuscode = 0;             /* HTTP Status code */
-    off_t contentlength = -1;        /* Value from Content-Length header */
-    int chunked = 0;                /* != if transfer-encoding is chunked */
+    int statuscode = 0;         /* HTTP Status code */
+    off_t contentlength = -1;   /* Value from Content-Length header */
+    int chunked = 0;            /* != if transfer-encoding is chunked */
     off_t clen;                 /* Chunk length */
     char * fname = NULL;        /* Name of downloaded file */
     uint32_t bytes_header_tmp = bytes_header;
@@ -674,7 +682,6 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
 
     /* No message body for 204 or 304 */
     if (statuscode == 204 || statuscode == 304) {
-        (*nres)++;
         return 0;
     }
 
@@ -777,21 +784,22 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
 
     mylog(LOG_INF, "#####################");
     if (protocol == IPPROTO_SCTP) {
-        mylog(LOG_ALL, "http://%s/%s - status: %d - req: %d - sctp sid: %d", servername, request->url, statuscode, *nres, lastStream);
+        mylog(LOG_ALL, "http://%s/%s - status: %d - sctp sid: %d", servername, request->url, statuscode, lastStream);
     } else {
-        mylog(LOG_ALL, "http://%s/%s - status: %d - req: %d", servername, request->url, statuscode, *nres);
+        mylog(LOG_ALL, "http://%s/%s - status: %d", servername, request->url, statuscode);
     }
     mylog(LOG_INF, "\t HEADER   : %d", bytes_header - bytes_header_tmp);
     mylog(LOG_INF, "\t PAYLOAD  : %d", bytes_payload - bytes_payload_tmp);
     mylog(LOG_INF, "#####################");
 
-    if (interactive) {
+    /* write to pipe */
+    if (interactive && use_pipe) {
         if ((request = TAILQ_FIRST(&requests_pending)) != NULL) {
             request->pipe_data.size_header = bytes_header - bytes_header_tmp;
             request->pipe_data.size_payload = bytes_payload - bytes_payload_tmp;
 
             write(fifo_out_fd, &(request->pipe_data), sizeof(struct sctp_pipe_data));
-            printf("\n####\nwriting to pipe : %d - %d\n####\n", request->pipe_data.size_header, request->pipe_data.size_payload = bytes_payload);
+            mylog(LOG_INF, "\n####\nwriting to pipe : %d - %d\n####", request->pipe_data.size_header, request->pipe_data.size_payload = bytes_payload);
         }
     }
 
@@ -808,14 +816,11 @@ main(int argc, char *argv[])
     char * reqbuf = NULL;           /* Request buffer */
     int reqbufpos = 0;              /* Request buffer position */
     int reqbuflen = 0;              /* Request buffer length */
-    int nreq = 0;                   /* Number of next request to send */
-    int nres = 0;                   /* Number of next reply to receive */
     int pipelined = 0;              /* != 0 if connection in pipelined mode. */
     int sd = -1;                    /* Socket descriptor */
     int sdflags = 0;                /* Flags on the socket sd */
     int error;                      /* Error code */
     int i = 0;                      /* For loop iterator */
-    int firstreq = 0;               /* # of first request for this connection */
     char *resbuf = NULL;            /* Response buffer */
     int resbuflen = 0;              /* Length of the receiver buffer */
     int keepalive = 0;              /* Keep-Alive indicator */
@@ -880,14 +885,12 @@ main(int argc, char *argv[])
         mylog(LOG_ALL, "[%d][%s] - interactive mode", __LINE__, __func__);
         interactive = 1;
 
-        mkfifo(fifo_out_name, 0666);
-        mkfifo(fifo_in_name, 0666);
-        printf("########################## fifo open ... \n");
-        fifo_in_fd = open(fifo_in_name, O_RDONLY);
-        printf("########################## in ready ...\n");
-        fifo_out_fd = open(fifo_out_name, O_WRONLY);
-        printf("########################## out ready ...\n");
-
+        if (use_pipe) {
+            mkfifo(fifo_out_name, 0666);
+            mkfifo(fifo_in_name, 0666);
+            fifo_in_fd = open(fifo_in_name, O_RDONLY);
+            fifo_out_fd = open(fifo_out_name, O_WRONLY);
+        }
     } else {
         /* Parse requests by cmdline arguments and queue them */
         for (i = 2; i < argc; i++) {
@@ -911,7 +914,6 @@ main(int argc, char *argv[])
         /* Make sure we have a connected socket */
         for (; sd == -1; res = res->ai_next) {
             setup_connection(res, &sd);
-            firstreq = nres;
         }
 
         /* Initialize select structs */
@@ -921,7 +923,9 @@ main(int argc, char *argv[])
         /* Hook stdin in select if we are interactive */
         if (interactive) {
             FD_SET(STDIN_FILENO, &fdsetrecv);
-            FD_SET(fifo_in_fd, &fdsetrecv);
+            if (use_pipe) {
+                FD_SET(fifo_in_fd, &fdsetrecv);
+            }
         }
 
         /* Bind sd to select functions - if we have requests open, hook for sending ... */
@@ -931,7 +935,11 @@ main(int argc, char *argv[])
         /* ... and always for receiving */
         FD_SET(sd, &fdsetrecv);
 
-        maxfd = MAX(MAX(STDIN_FILENO, sd), fifo_in_fd) + 1;
+        if (use_pipe) {
+            maxfd = MAX(MAX(STDIN_FILENO, sd), fifo_in_fd) + 1;
+        } else {
+            maxfd = MAX(STDIN_FILENO, sd) + 1;
+        }
 
         /* Select section - handle stdin and socket */
         if ((selectsock = select(maxfd, &fdsetrecv, &fdsetsend, NULL, NULL)) < 0) {
@@ -967,7 +975,7 @@ main(int argc, char *argv[])
         }
 
         /* Ready to read a new request from FIFO */
-        if (FD_ISSET(fifo_in_fd, &fdsetrecv)) {
+        if (use_pipe && FD_ISSET(fifo_in_fd, &fdsetrecv)) {
             mylog(LOG_INF, "[%d][%s] - select for FIFO", __LINE__, __func__);
 
             if ((request = malloc(sizeof(struct request))) == NULL) {
@@ -989,8 +997,6 @@ main(int argc, char *argv[])
                 goto cleanupconn;
             } else {
                 request->pipe_data.path[strcspn(request->pipe_data.path, "\n")] = 0;
-                printf("#####\n->%s<-\n#####", request->pipe_data.path);
-
                 snprintf(request->url, BUFSIZ, "%s", request->pipe_data.path);
                 TAILQ_INSERT_TAIL(&requests_open, request, entries);
                 num_req_open++;
@@ -1074,7 +1080,6 @@ main(int argc, char *argv[])
                     TAILQ_REMOVE(&requests_open, request, entries);
                     TAILQ_INSERT_TAIL(&requests_pending, request, entries);
 
-                    nreq++;
                     num_req_open--;
                     num_req_pending++;
 
@@ -1116,7 +1121,6 @@ main(int argc, char *argv[])
                 TAILQ_REMOVE(&requests_open, request, entries);
                 TAILQ_INSERT_TAIL(&requests_pending, request, entries);
 
-                nreq++;
                 num_req_open--;
                 num_req_pending++;
                 mylog(LOG_INF, "[%d][%s] - %s : open -> pending (blocking part)", __LINE__, __func__, request->url);
@@ -1129,7 +1133,7 @@ main(int argc, char *argv[])
         if ((request = TAILQ_FIRST(&requests_pending)) != NULL) {
             /* handle_response succeeded - remove pending element from queue */
             mylog(LOG_INF, "handling response for %s", request->url);
-            if (handle_response(&sd, &fd, resbuf, &resbuflen, &resbufpos, &nres, request, &keepalive, &pipelined) == 0) {
+            if (handle_response(&sd, &fd, resbuf, &resbuflen, &resbufpos, request, &keepalive, &pipelined) == 0) {
                 TAILQ_REMOVE(&requests_pending, request, entries);
 
                 if (interactive) {
@@ -1139,8 +1143,8 @@ main(int argc, char *argv[])
                 free(request);
 
                 /* We've finished this file! */
-                num_req_finished++;
                 num_req_pending--;
+                num_req_finished++;
                 streamstatus[lastStream] = STREAM_FREE;
                 /* at least one stream is free for a new request */
                 streamsbusy = 0;
@@ -1171,7 +1175,7 @@ conndied:
          * request.
          */
 
-        if (nres == firstreq) {
+        if (num_req_open == 1) {
             mylog(LOG_ALL, "[%d][%s] - connection failure", __LINE__, __func__);
             exit(EXIT_FAILURE);
         }
@@ -1193,7 +1197,6 @@ cleanupconn:
             free(reqbuf);
             reqbuf = NULL;
         }
-        nreq = nres; // we did'nt sent all nres..
 
         /* requeue all pending requests */
         while (num_req_pending > 0) {
@@ -1210,7 +1213,6 @@ cleanupconn:
             mylog(LOG_INF, "[%d][%s] - %s : pending -> open", __LINE__, __func__, request->url);
         }
 
-
         res = res0;
         pipelined = 0;
         resbuflen = 0;
@@ -1218,7 +1220,7 @@ cleanupconn:
         continue;
     }
 
-    mylog(LOG_ALL, "###### STATS ######\n");
+    mylog(LOG_ALL, "###### STATS ######");
     mylog(LOG_ALL, "\trequests      : %d", num_req_finished);
     mylog(LOG_ALL, "\tbytes header  : %d", bytes_header);
     mylog(LOG_ALL, "\tbytes payload : %d", bytes_payload);
