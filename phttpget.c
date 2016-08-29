@@ -89,6 +89,9 @@ static uint32_t         bytes_payload = 0;
 static uint8_t          interactive = 0;
 static uint8_t          use_pipe = 0;
 static uint8_t          save_file = 0;                      /* save received data to file */
+static uint32_t         status_200 = 0;
+static uint32_t         status_404 = 0;
+static uint32_t         status_other = 0;
 
 
 int fifo_in_fd = -1;
@@ -776,17 +779,31 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
         *pipelined = 0;
     }
 
-
+    /* close filedescriptor if open */
     if (*fd != -1) {
         close(*fd);
         *fd = -1;
     }
 
+
+    /* status stats */
+    switch (statuscode) {
+        case 200:
+            status_200++;
+            break;
+        case 404:
+            status_404++;
+            break;
+        default:
+            status_other++;
+            break;
+    }
+
     mylog(LOG_INF, "#####################");
     if (protocol == IPPROTO_SCTP) {
-        mylog(LOG_ALL, "http://%s/%s - status: %d - sctp sid: %d", servername, request->url, statuscode, lastStream);
+        mylog(LOG_ALL, "%d - http://%s/%s - sctp sid: %d", statuscode, servername, request->url, lastStream);
     } else {
-        mylog(LOG_ALL, "http://%s/%s - status: %d", servername, request->url, statuscode);
+        mylog(LOG_ALL, "%d - http://%s/%s", statuscode, servername, request->url);
     }
     mylog(LOG_INF, "\t HEADER   : %d", bytes_header - bytes_header_tmp);
     mylog(LOG_INF, "\t PAYLOAD  : %d", bytes_payload - bytes_payload_tmp);
@@ -1151,9 +1168,9 @@ main(int argc, char *argv[])
             }
 
         } else if (request == NULL) {
-            mylog(LOG_ALL, "[%d][%s] - no pending request left... fix logic!", __LINE__, __func__);
+            mylog(LOG_ALL, "[%d][%s] - no pending request left... timeout?", __LINE__, __func__);
             exit(EXIT_FAILURE);
-            goto cleanupconn;
+            //goto cleanupconn;
         }
 
 
@@ -1224,7 +1241,7 @@ cleanupconn:
     mylog(LOG_ALL, "\trequests      : %d", num_req_finished);
     mylog(LOG_ALL, "\tbytes header  : %d", bytes_header);
     mylog(LOG_ALL, "\tbytes payload : %d", bytes_payload);
-
+    mylog(LOG_ALL, "\tstatuscounter : %d 200 / %d 404 / %d other", status_200, status_404, status_other);
 
     free(resbuf);
     freeaddrinfo(res0);
