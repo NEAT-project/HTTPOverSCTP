@@ -1,6 +1,6 @@
 #!/bin/sh
 
-export HTTP_TRANSPORT_PROTOCOL=TCP
+export HTTP_TRANSPORT_PROTOCOL=SCTP
 echo $HTTP_TRANSPORT_PROTOCOL
 time ./phttpget bsd3.nplab.de \
 chunks/chunk-0-0.jpg \

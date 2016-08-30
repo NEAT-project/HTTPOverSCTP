@@ -29,10 +29,13 @@
 __FBSDID("$FreeBSD: head/usr.sbin/portsnap/phttpget/phttpget.c 190679 2009-04-03 21:13:18Z cperciva $");
 #endif
 
-#ifdef linux
+#ifdef __linux__
 #define _GNU_SOURCE
 #define OFF_MAX LONG_MAX
+#define _XOPEN_SOURCE 600
+#include <sys/select.h>
 #endif
+
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/socket.h>
@@ -58,6 +61,7 @@ __FBSDID("$FreeBSD: head/usr.sbin/portsnap/phttpget/phttpget.c 190679 2009-04-03
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <strings.h>
 
 /* maximum SCTP streams */
 #define NUM_SCTP_STREAMS    10
@@ -267,6 +271,9 @@ setup_connection(struct addrinfo *res, int *sd) {
 #ifdef SCTP_REMOTE_UDP_ENCAPS_PORT
     struct sctp_udpencaps encaps;   /* SCTP/UDP information */
 #endif
+#ifdef __linux__
+    struct sctp_event_subscribe subscribe;
+#endif
 
 
     /* Initialize the stream status array */
@@ -299,17 +306,31 @@ setup_connection(struct addrinfo *res, int *sd) {
         initmsg.sinit_max_instreams = NUM_SCTP_STREAMS;
         initmsg.sinit_max_attempts = 0;   /* Use default */
         initmsg.sinit_max_init_timeo = 0; /* Use default */
-        if (setsockopt(*sd, IPPROTO_SCTP, SCTP_INITMSG, (char*) &initmsg, sizeof(initmsg) ) < 0 ) {
+        if (setsockopt(*sd, IPPROTO_SCTP, SCTP_INITMSG, (char*) &initmsg, sizeof(initmsg)) < 0) {
             mylog(LOG_ERR, "[%d][%s] - setsockopt failed", __LINE__, __func__);
             exit(EXIT_FAILURE);
         }
 
-        /* Enable RCVINFO delivery */
         val = 1;
-        if (setsockopt(*sd, IPPROTO_SCTP, SCTP_RECVRCVINFO, (char*) &val, sizeof(val) ) < 0 ) {
+
+#ifdef __FreeBSD__
+        /* Enable RCVINFO delivery */
+        if (setsockopt(*sd, IPPROTO_SCTP, SCTP_RECVRCVINFO, (char*) &val, sizeof(val)) < 0) {
             mylog(LOG_ERR, "[%d][%s] - setsockopt failed", __LINE__, __func__);
             exit(EXIT_FAILURE);
         }
+#endif
+
+#ifdef __linux__
+        /* sorry michael ... i know this must hurt you! :) */
+        memset(&subscribe, 0, sizeof(subscribe));
+        subscribe.sctp_data_io_event = val;
+        /* subscribe.sctp_association_event = val; */
+        if (setsockopt(*sd, SOL_SCTP, SCTP_EVENTS, (char *)&subscribe, sizeof(subscribe)) < 0) {
+            mylog(LOG_ERR, "[%d][%s] - setsockopt failed", __LINE__, __func__);
+            exit(EXIT_FAILURE);
+        }
+#endif
 
 #ifdef SCTP_REMOTE_UDP_ENCAPS_PORT
         /* Use UDP encapsulation for SCTP */
@@ -350,10 +371,19 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
     ssize_t len = 0;
     struct msghdr msg;
     struct iovec iov;
+    struct cmsghdr *scmsg;
+#ifdef __FreeBSD__
     char cmsgbuf[CMSG_SPACE(sizeof(struct sctp_rcvinfo))];
     struct sctp_rcvinfo *rcvinfo;
-
     memset(cmsgbuf, 0, CMSG_SPACE(sizeof(struct sctp_rcvinfo)));
+#endif
+#ifdef __linux__
+    char cmsgbuf[CMSG_SPACE(sizeof(struct sctp_sndrcvinfo))];
+    struct sctp_sndrcvinfo *rcvinfo;
+    memset(cmsgbuf, 0, CMSG_SPACE(sizeof(struct sctp_sndrcvinfo)));
+#endif
+
+
 
     while (strnstr(resbuf + *resbufpos, "\r\n", *resbuflen - *resbufpos) == NULL) {
         /* Move buffered data to the start of the buffer */
@@ -379,12 +409,32 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
         msg.msg_iovlen = 1;
         msg.msg_control = cmsgbuf;
         msg.msg_controllen = sizeof(cmsgbuf);
-        rcvinfo = (struct sctp_rcvinfo *)CMSG_DATA(cmsgbuf);
         len = recvmsg(sd, &msg, 0);
 
-        /* Stream we received data from */
+
+        if ((MSG_NOTIFICATION & msg.msg_flags)) {
+            fprintf(stderr, "got notification... fix me!\n");
+            exit(EXIT_FAILURE);
+            continue;
+        }
+
         if (protocol == IPPROTO_SCTP) {
+            /* Stream we received data from */
+            scmsg = CMSG_FIRSTHDR(&msg);
+            if (scmsg == NULL) {
+                mylog(LOG_ALL, "[%d][%s] - CMSG_FIRSTHDR() failed - len %d", __LINE__, __func__, len);
+                exit(EXIT_FAILURE);
+            }
+
+#ifdef __FreeBSD__
+            rcvinfo = (struct sctp_rcvinfo *)CMSG_DATA(scmsg);
             lastStream = rcvinfo->rcv_sid;
+#endif
+#ifdef __linux__
+            rcvinfo = (struct sctp_sndrcvinfo *)CMSG_DATA(scmsg);
+            lastStream = rcvinfo->sinfo_stream;
+#endif
+
         }
 
         /* If recvmsg returned 0 or -1 (no interrupt) - we stop reading */
@@ -406,10 +456,14 @@ copybytes(int sd, int fd, off_t copylen, char *resbuf, int *resbuflen, int *resb
     ssize_t len;
     struct msghdr msg;
     struct iovec iov;
+#ifdef __FreeBSD__
     char cmsgbuf[CMSG_SPACE(sizeof(struct sctp_rcvinfo))];
-    struct sctp_rcvinfo *rcvinfo;
-
     memset(cmsgbuf, 0, CMSG_SPACE(sizeof(struct sctp_rcvinfo)));
+#endif
+#ifdef __linux__
+    char cmsgbuf[CMSG_SPACE(sizeof(struct sctp_sndrcvinfo))];
+    memset(cmsgbuf, 0, CMSG_SPACE(sizeof(struct sctp_sndrcvinfo)));
+#endif
 
     while (copylen) {
         /* Write data from resbuf to fd */
@@ -443,7 +497,6 @@ copybytes(int sd, int fd, off_t copylen, char *resbuf, int *resbuflen, int *resb
         msg.msg_iovlen = 1;
         msg.msg_control = cmsgbuf;
         msg.msg_controllen = sizeof(cmsgbuf);
-        rcvinfo = (struct sctp_rcvinfo *)CMSG_DATA(cmsgbuf);
 
         /* Read more data into buffer */
         if ((len = recvmsg(sd, &msg, 0)) == -1) {
@@ -459,9 +512,6 @@ copybytes(int sd, int fd, off_t copylen, char *resbuf, int *resbuflen, int *resb
             mylog(LOG_DBG, "[%d][%s] - read %d bytes ", __LINE__, __func__, len);
             *resbuflen = len;
             *resbufpos = 0;
-            if (protocol == IPPROTO_SCTP) {
-                lastStream = rcvinfo->rcv_sid;
-            }
         }
     }
 
@@ -470,16 +520,23 @@ copybytes(int sd, int fd, off_t copylen, char *resbuf, int *resbuflen, int *resb
 
 static int
 send_request(int sd,  char *reqbuf, int *reqbuflen, int *reqbufpos) {
+#ifdef __FreeBsd__
     char* cmsgbuf[CMSG_SPACE(sizeof(struct sctp_sndinfo))];
+    struct sctp_sndinfo *sndinfo;
+#endif
+#ifdef __linux__
+    char cmsgbuf[CMSG_SPACE(sizeof(struct sctp_sndrcvinfo))];
+    struct sctp_sndrcvinfo *sndinfo;
+#endif
     struct iovec iov;
     struct msghdr msghdr;
-    struct sctp_sndinfo *sndinfo;
+
     struct cmsghdr *cmsg;
     int len;
     int i;
 
     /* initialize */
-    memset(cmsgbuf, 0, CMSG_SPACE(sizeof(struct sctp_sndinfo)));
+    memset(cmsgbuf, 0, sizeof(cmsgbuf));
     memset(&msghdr, 0, sizeof(struct msghdr));
     memset(&iov, 0, sizeof(struct iovec));
 
@@ -491,20 +548,33 @@ send_request(int sd,  char *reqbuf, int *reqbuflen, int *reqbufpos) {
     /* if using SCTP, append control msg to define outgoing stream */
     if (protocol == IPPROTO_SCTP) {
         msghdr.msg_control = cmsgbuf;
-        msghdr.msg_controllen = CMSG_SPACE(sizeof(struct sctp_sndinfo));
+        msghdr.msg_controllen = sizeof(cmsgbuf);
 
         cmsg = CMSG_FIRSTHDR(&msghdr);
         cmsg->cmsg_level = IPPROTO_SCTP;
+        cmsg->cmsg_len = sizeof(cmsgbuf);
+#ifdef __FreeBsd__
         cmsg->cmsg_type = SCTP_SNDINFO;
-        cmsg->cmsg_len = CMSG_LEN(sizeof(struct sctp_sndinfo));
         sndinfo = (struct sctp_sndinfo*) CMSG_DATA(cmsg);
+#endif
+#ifdef __linux__
+        cmsg->cmsg_type = SCTP_SNDRCV;
+        sndinfo = (struct sctp_sndrcvinfo*) CMSG_DATA(cmsg);
+#endif
+
+
         streamsbusy = 1;
 
         /* lookup next free stream - if all streams busy return with -2 */
         for (i = 0; i < NUM_SCTP_STREAMS; i++) {
             if (streamstatus[i] == STREAM_FREE) {
                 streamstatus[i] = STREAM_USED;
+#ifdef __FreeBsd__
                 sndinfo->snd_sid = i;
+#endif
+#ifdef __linux__
+                sndinfo->sinfo_stream = i;
+#endif
                 streamsbusy = 0;
                 break;
             }
@@ -859,8 +929,8 @@ main(int argc, char *argv[])
     int num_req_open = 0;
     int num_req_pending = 0;
     int num_req_finished = 0;
-    struct fd_set fdsetrecv;
-    struct fd_set fdsetsend;
+    fd_set fdsetrecv;
+    fd_set fdsetsend;
     int maxfd = 0;
     int selectsock = -1;
     int len = 0;
