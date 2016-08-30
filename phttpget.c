@@ -80,7 +80,7 @@ static char *           env_HTTP_DEBUG;
 static char *           env_HTTP_PIPE;
 
 static struct           timeval timo = {15, 0};
-static uint8_t          log_level = LOG_ERR;                /* 0 = none | 1 = error | 2 = verbose | 3 = very verbose */
+static uint8_t          log_level = LOG_ALL;                /* 0 = none | 1 = error | 2 = verbose | 3 = very verbose */
 static in_port_t        udp_encaps_port = 0;
 static int              protocol = IPPROTO_SCTP;
 static uint8_t          streamstatus[NUM_SCTP_STREAMS];
@@ -111,7 +111,7 @@ struct sctp_pipe_data {
     uint32_t    size_header;
     uint32_t    size_payload;
     char        path[FIFO_BUFFER_SIZE];
-};
+} __attribute__ ((packed));
 
 struct request {
     char *url;
@@ -873,9 +873,9 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
 
     mylog(LOG_INF, "#####################");
     if (protocol == IPPROTO_SCTP) {
-        mylog(LOG_ALL, "%d - http://%s/%s - sctp sid: %d", statuscode, servername, request->url, lastStream);
+        mylog(LOG_ALL, "%d - %d - %s - sctp sid: %d", status_200 + status_404 + status_other, statuscode, request->url, lastStream);
     } else {
-        mylog(LOG_ALL, "%d - http://%s/%s", statuscode, servername, request->url);
+        mylog(LOG_ALL, "%d - %d - %s", status_200 + status_404 + status_other, statuscode, request->url);
     }
     mylog(LOG_INF, "\t HEADER   : %d", bytes_header - bytes_header_tmp);
     mylog(LOG_INF, "\t PAYLOAD  : %d", bytes_payload - bytes_payload_tmp);
@@ -897,8 +897,6 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
 
                 len_left -= len;
             }
-
-            mylog(LOG_INF, "\n####\nwriting to pipe : %d - %d\n####", request->pipe_data.size_header, request->pipe_data.size_payload = bytes_payload);
         }
     }
 
@@ -1042,6 +1040,8 @@ main(int argc, char *argv[])
             maxfd = MAX(STDIN_FILENO, sd) + 1;
         }
 
+        fprintf(stderr, "waiting... open: %d - pending: %d - finished: %d\n", num_req_open, num_req_pending, num_req_finished);
+
         /* Select section - handle stdin and socket */
         if ((selectsock = select(maxfd, &fdsetrecv, &fdsetsend, NULL, NULL)) < 0) {
             mylog(LOG_ERR, "[%d][%s] - select failed", __LINE__, __func__);
@@ -1091,31 +1091,33 @@ main(int argc, char *argv[])
 
             len_left = sizeof(struct sctp_pipe_data);
             while (len_left > 0) {
-                len = read(fifo_in_fd, &(request->pipe_data), sizeof(struct sctp_pipe_data));
-                mylog(LOG_INF, "[%d][%s] - fifo read : %d byte", __LINE__, __func__, len);
+                len = read(fifo_in_fd, &(request->pipe_data), len_left);
+                mylog(LOG_ALL, "[%d][%s] - fifo read : %d byte", __LINE__, __func__, len);
                 if (len == 0) {
                     mylog(LOG_ERR, "[%d][%s] - fifo read failed - pipe closed", __LINE__, __func__);
                     interactive = 0;
                     free(request->url);
                     free(request);
+                    exit(EXIT_FAILURE);
                     goto cleanupconn;
                 } else if (len == -1) {
                     mylog(LOG_ERR, "[%d][%s] - fifo read failed: %d - %s", __LINE__, __func__, errno, strerror(errno));
                     interactive = 0;
                     free(request->url);
                     free(request);
+                    exit(EXIT_FAILURE);
                     goto cleanupconn;
                 }
 
                 len_left -= len;
             }
 
-            request->pipe_data.path[strcspn(request->pipe_data.path, "\n")] = 0;
+            //request->pipe_data.path[strcspn(request->pipe_data.path, "\n")] = 0;
             snprintf(request->url, BUFSIZ, "%s", request->pipe_data.path);
             TAILQ_INSERT_TAIL(&requests_open, request, entries);
             num_req_open++;
 
-            mylog(LOG_ALL, "[%d][%s] - queueing : %s", __LINE__, __func__, request->url);
+            mylog(LOG_ALL, "[%d][%s] - queueing : %d - %s", __LINE__, __func__, request->pipe_data.request_id, request->url);
 
             continue;
         }
