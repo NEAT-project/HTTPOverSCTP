@@ -520,7 +520,7 @@ copybytes(int sd, int fd, off_t copylen, char *resbuf, int *resbuflen, int *resb
 
 static int
 send_request(int sd,  char *reqbuf, int *reqbuflen, int *reqbufpos) {
-#ifdef __FreeBsd__
+#ifdef __FreeBSD__
     char* cmsgbuf[CMSG_SPACE(sizeof(struct sctp_sndinfo))];
     struct sctp_sndinfo *sndinfo;
 #endif
@@ -553,7 +553,7 @@ send_request(int sd,  char *reqbuf, int *reqbuflen, int *reqbufpos) {
         cmsg = CMSG_FIRSTHDR(&msghdr);
         cmsg->cmsg_level = IPPROTO_SCTP;
         cmsg->cmsg_len = sizeof(cmsgbuf);
-#ifdef __FreeBsd__
+#ifdef __FreeBSD__
         cmsg->cmsg_type = SCTP_SNDINFO;
         sndinfo = (struct sctp_sndinfo*) CMSG_DATA(cmsg);
 #endif
@@ -569,7 +569,7 @@ send_request(int sd,  char *reqbuf, int *reqbuflen, int *reqbufpos) {
         for (i = 0; i < NUM_SCTP_STREAMS; i++) {
             if (streamstatus[i] == STREAM_FREE) {
                 streamstatus[i] = STREAM_USED;
-#ifdef __FreeBsd__
+#ifdef __FreeBSD__
                 sndinfo->snd_sid = i;
 #endif
 #ifdef __linux__
