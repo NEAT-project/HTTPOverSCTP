@@ -79,8 +79,8 @@ static char *           env_HTTP_SCTP_UDP_ENCAPS_PORT;
 static char *           env_HTTP_DEBUG;
 static char *           env_HTTP_PIPE;
 
-static struct           timeval timo = {15, 0};
-static uint8_t          log_level = LOG_ALL;                /* 0 = none | 1 = error | 2 = verbose | 3 = very verbose */
+static struct timeval   timo = {15, 0};
+static uint8_t          log_level = LOG_ERR;                /* 0 = none | 1 = error | 2 = verbose | 3 = very verbose */
 static in_port_t        udp_encaps_port = 0;
 static int              protocol = IPPROTO_SCTP;
 static uint8_t          streamstatus[NUM_SCTP_STREAMS];
@@ -106,7 +106,7 @@ char *fifo_out_name = "/tmp/phttpget-out";
 enum stream_status {STREAM_FREE, STREAM_USED};
 
 struct sctp_pipe_data {
-    uint32_t    request_id;
+    uint32_t    id;
     uint32_t    pathlen;
     uint32_t    size_header;
     uint32_t    size_payload;
@@ -114,6 +114,7 @@ struct sctp_pipe_data {
 } __attribute__ ((packed));
 
 struct request {
+    uint32_t    id;
     char *url;
     struct sctp_pipe_data pipe_data;
     TAILQ_ENTRY(request) entries;
@@ -413,7 +414,7 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
 
 
         if ((MSG_NOTIFICATION & msg.msg_flags)) {
-            fprintf(stderr, "got notification... fix me!\n");
+            mylog(LOG_ERR, "[%d][%s] - recvmsg - got notification - fixme", __LINE__, __func__);
             exit(EXIT_FAILURE);
             continue;
         }
@@ -422,7 +423,7 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
             /* Stream we received data from */
             scmsg = CMSG_FIRSTHDR(&msg);
             if (scmsg == NULL) {
-                mylog(LOG_ALL, "[%d][%s] - CMSG_FIRSTHDR() failed - len %d", __LINE__, __func__, len);
+                mylog(LOG_ERR, "[%d][%s] - CMSG_FIRSTHDR() failed - len %d", __LINE__, __func__, len);
                 exit(EXIT_FAILURE);
             }
 
@@ -479,7 +480,7 @@ copybytes(int sd, int fd, off_t copylen, char *resbuf, int *resbuflen, int *resb
                 mylog(LOG_INF, "[%d][%s] - fd == -1 - discarding", __LINE__, __func__);
             /* we have valid fd - so write to file */
             } else if ((len = write(fd, resbuf + *resbufpos, len)) == -1) {
-                mylog(LOG_ALL, "[%d][%s] - write() failed - fix it!", __LINE__, __func__);
+                mylog(LOG_ERR, "[%d][%s] - write() failed - fix it!", __LINE__, __func__);
                 exit(EXIT_FAILURE);
             }
 
@@ -509,7 +510,7 @@ copybytes(int sd, int fd, off_t copylen, char *resbuf, int *resbuflen, int *resb
             mylog(LOG_ERR, "[%d][%s] - recvmsg() returned 0", __LINE__, __func__);
             return -2;
         } else {
-            mylog(LOG_DBG, "[%d][%s] - read %d bytes ", __LINE__, __func__, len);
+            mylog(LOG_INF, "[%d][%s] - read %d bytes ", __LINE__, __func__, len);
             *resbuflen = len;
             *resbufpos = 0;
         }
@@ -889,7 +890,7 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
 
             len_left = sizeof(struct sctp_pipe_data);
             while (len_left > 0) {
-                len = write(fifo_out_fd, &(request->pipe_data), sizeof(struct sctp_pipe_data));
+                len = write(fifo_out_fd, &(request->pipe_data) + sizeof(struct sctp_pipe_data) - len_left, len_left);
                 mylog(LOG_INF, "[%d][%s] - fifo write : %d byte", __LINE__, __func__, len);
                 if (len == -1 || len == 0) {
                     mylog(LOG_ERR, "[%d][%s] - fifo write failed: %d - %s", __LINE__, __func__, errno, strerror(errno));
@@ -933,6 +934,7 @@ main(int argc, char *argv[])
     int selectsock = -1;
     int len = 0;
     int len_left = 0;
+    uint8_t num_req = 0;
 
     /* Initialize open (unsent) requests and pending requests queues */
     TAILQ_INIT(&requests_open);
@@ -997,7 +999,8 @@ main(int argc, char *argv[])
                 mylog(LOG_ERR, "[%d][%s] - malloc failed", __LINE__, __func__);
                 exit(EXIT_FAILURE);
             }
-
+            num_req++;
+            request->id = num_req;
             request->url = argv[i];
             mylog(LOG_INF, "[%d][%s] - queueing : %s", __LINE__, __func__, request->url);
             TAILQ_INSERT_TAIL(&requests_open, request, entries);
@@ -1040,7 +1043,7 @@ main(int argc, char *argv[])
             maxfd = MAX(STDIN_FILENO, sd) + 1;
         }
 
-        fprintf(stderr, "waiting... open: %d - pending: %d - finished: %d\n", num_req_open, num_req_pending, num_req_finished);
+        //fprintf(stderr, "waiting... open: %d - pending: %d - finished: %d\n", num_req_open, num_req_pending, num_req_finished);
 
         /* Select section - handle stdin and socket */
         if ((selectsock = select(maxfd, &fdsetrecv, &fdsetsend, NULL, NULL)) < 0) {
@@ -1066,6 +1069,8 @@ main(int argc, char *argv[])
                 mylog(LOG_ERR, "[%d][%s] - fgets failed", __LINE__, __func__);
                 exit(EXIT_FAILURE);
             } else {
+                num_req++;
+                request->id = num_req;
                 request->url[strcspn(request->url, "\n")] = 0;
                 TAILQ_INSERT_TAIL(&requests_open, request, entries);
                 num_req_open++;
@@ -1084,26 +1089,19 @@ main(int argc, char *argv[])
                 exit(EXIT_FAILURE);
             }
 
-            if ((request->url = malloc(BUFSIZ)) == NULL) {
-                mylog(LOG_ERR, "[%d][%s] - malloc failed", __LINE__, __func__);
-                exit(EXIT_FAILURE);
-            }
-
             len_left = sizeof(struct sctp_pipe_data);
             while (len_left > 0) {
-                len = read(fifo_in_fd, &(request->pipe_data), len_left);
-                mylog(LOG_ALL, "[%d][%s] - fifo read : %d byte", __LINE__, __func__, len);
+                len = read(fifo_in_fd, &(request->pipe_data) + sizeof(struct sctp_pipe_data) - len_left, len_left);
+                mylog(LOG_INF, "[%d][%s] - fifo read : %d byte", __LINE__, __func__, len);
                 if (len == 0) {
                     mylog(LOG_ERR, "[%d][%s] - fifo read failed - pipe closed", __LINE__, __func__);
                     interactive = 0;
-                    free(request->url);
                     free(request);
                     exit(EXIT_FAILURE);
                     goto cleanupconn;
                 } else if (len == -1) {
                     mylog(LOG_ERR, "[%d][%s] - fifo read failed: %d - %s", __LINE__, __func__, errno, strerror(errno));
                     interactive = 0;
-                    free(request->url);
                     free(request);
                     exit(EXIT_FAILURE);
                     goto cleanupconn;
@@ -1113,12 +1111,14 @@ main(int argc, char *argv[])
             }
 
             //request->pipe_data.path[strcspn(request->pipe_data.path, "\n")] = 0;
-            snprintf(request->url, BUFSIZ, "%s", request->pipe_data.path);
+            num_req++;
+            request->id = request->pipe_data.id;
+            request->url = request->pipe_data.path;
+            //snprintf(request->url, BUFSIZ, "%s", request->pipe_data.path);
             TAILQ_INSERT_TAIL(&requests_open, request, entries);
             num_req_open++;
 
-            mylog(LOG_ALL, "[%d][%s] - queueing : %d - %s", __LINE__, __func__, request->pipe_data.request_id, request->url);
-
+            mylog(LOG_INF, "[%d][%s] - queueing : %d - %s", __LINE__, __func__, request->pipe_data.id, request->url);
             continue;
         }
 
@@ -1252,7 +1252,7 @@ main(int argc, char *argv[])
             if (handle_response(&sd, &fd, resbuf, &resbuflen, &resbufpos, request, &keepalive, &pipelined) == 0) {
                 TAILQ_REMOVE(&requests_pending, request, entries);
 
-                if (interactive) {
+                if (interactive && !use_pipe) {
                     free(request->url);
                 }
 
@@ -1317,12 +1317,12 @@ cleanupconn:
         /* requeue all pending requests */
         while (num_req_pending > 0) {
             /* pending requests have to be resent */
-            if ((request = TAILQ_LAST(&requests_pending, request_queue)) == NULL) {
+            if ((request = TAILQ_FIRST(&requests_pending)) == NULL) {
                 mylog(LOG_ALL, "[%d][%s] - this should not happen ... fix", __LINE__, __func__);
                 exit(EXIT_FAILURE);
             }
             TAILQ_REMOVE(&requests_pending, request, entries);
-            TAILQ_INSERT_HEAD(&requests_open, request, entries);
+            TAILQ_INSERT_TAIL(&requests_open, request, entries);
             num_req_open++;
             num_req_pending--;
 
