@@ -76,7 +76,7 @@ static char *           env_HTTP_DEBUG;
 static char *           env_HTTP_PIPE;
 
 static struct           timeval timo = {15, 0};
-static uint8_t          log_level = LOG_ALL;                /* 0 = none | 1 = error | 2 = verbose | 3 = very verbose */
+static uint8_t          log_level = LOG_ERR;                /* 0 = none | 1 = error | 2 = verbose | 3 = very verbose */
 static in_port_t        udp_encaps_port = 0;
 static int              protocol = IPPROTO_SCTP;
 static uint8_t          streamstatus[NUM_SCTP_STREAMS];
@@ -102,10 +102,10 @@ char *fifo_out_name = "/tmp/phttpget-out";
 enum stream_status {STREAM_FREE, STREAM_USED};
 
 struct sctp_pipe_data {
+    uint32_t    request_id;
     uint32_t    pathlen;
     uint32_t    size_header;
     uint32_t    size_payload;
-    pthread_t   tid;
     char        path[FIFO_BUFFER_SIZE];
 };
 
@@ -456,7 +456,7 @@ copybytes(int sd, int fd, off_t copylen, char *resbuf, int *resbuflen, int *resb
             mylog(LOG_ERR, "[%d][%s] - recvmsg() returned 0", __LINE__, __func__);
             return -2;
         } else {
-            mylog(LOG_ERR, "[%d][%s] - read %d bytes ", __LINE__, __func__, len);
+            mylog(LOG_DBG, "[%d][%s] - read %d bytes ", __LINE__, __func__, len);
             *resbuflen = len;
             *resbufpos = 0;
             if (protocol == IPPROTO_SCTP) {
@@ -546,6 +546,8 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
     char * fname = NULL;        /* Name of downloaded file */
     uint32_t bytes_header_tmp = bytes_header;
     uint32_t bytes_payload_tmp = bytes_payload;
+    int len = 0;
+    int len_left = 0;
 
     *keepalive = 0;
 
@@ -815,7 +817,17 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
             request->pipe_data.size_header = bytes_header - bytes_header_tmp;
             request->pipe_data.size_payload = bytes_payload - bytes_payload_tmp;
 
-            write(fifo_out_fd, &(request->pipe_data), sizeof(struct sctp_pipe_data));
+            len_left = sizeof(struct sctp_pipe_data);
+            while (len_left > 0) {
+                len = write(fifo_out_fd, &(request->pipe_data), sizeof(struct sctp_pipe_data));
+                mylog(LOG_INF, "[%d][%s] - fifo write : %d byte", __LINE__, __func__, len);
+                if (len == -1 || len == 0) {
+                    mylog(LOG_ERR, "[%d][%s] - fifo write failed: %d - %s", __LINE__, __func__, errno, strerror(errno));
+                }
+
+                len_left -= len;
+            }
+
             mylog(LOG_INF, "\n####\nwriting to pipe : %d - %d\n####", request->pipe_data.size_header, request->pipe_data.size_payload = bytes_payload);
         }
     }
@@ -851,6 +863,8 @@ main(int argc, char *argv[])
     struct fd_set fdsetsend;
     int maxfd = 0;
     int selectsock = -1;
+    int len = 0;
+    int len_left = 0;
 
     /* Initialize open (unsent) requests and pending requests queues */
     TAILQ_INIT(&requests_open);
@@ -1005,21 +1019,34 @@ main(int argc, char *argv[])
                 exit(EXIT_FAILURE);
             }
 
-            if (read(fifo_in_fd, &(request->pipe_data), sizeof(struct sctp_pipe_data)) != sizeof(struct sctp_pipe_data)) {
-                mylog(LOG_ERR, "[%d][%s] - fifo read failed", __LINE__, __func__);
-                // felix refactoring!!
-                interactive = 0;
-                free(request->url);
-                free(request);
-                goto cleanupconn;
-            } else {
-                request->pipe_data.path[strcspn(request->pipe_data.path, "\n")] = 0;
-                snprintf(request->url, BUFSIZ, "%s", request->pipe_data.path);
-                TAILQ_INSERT_TAIL(&requests_open, request, entries);
-                num_req_open++;
+            len_left = sizeof(struct sctp_pipe_data);
+            while (len_left > 0) {
+                len = read(fifo_in_fd, &(request->pipe_data), sizeof(struct sctp_pipe_data));
+                mylog(LOG_INF, "[%d][%s] - fifo read : %d byte", __LINE__, __func__, len);
+                if (len == 0) {
+                    mylog(LOG_ERR, "[%d][%s] - fifo read failed - pipe closed", __LINE__, __func__);
+                    interactive = 0;
+                    free(request->url);
+                    free(request);
+                    goto cleanupconn;
+                } else if (len == -1) {
+                    mylog(LOG_ERR, "[%d][%s] - fifo read failed: %d - %s", __LINE__, __func__, errno, strerror(errno));
+                    interactive = 0;
+                    free(request->url);
+                    free(request);
+                    goto cleanupconn;
+                }
 
-                mylog(LOG_INF, "[%d][%s] - queueing : %s", __LINE__, __func__, request->url);
+                len_left -= len;
             }
+
+            request->pipe_data.path[strcspn(request->pipe_data.path, "\n")] = 0;
+            snprintf(request->url, BUFSIZ, "%s", request->pipe_data.path);
+            TAILQ_INSERT_TAIL(&requests_open, request, entries);
+            num_req_open++;
+
+            mylog(LOG_ALL, "[%d][%s] - queueing : %s", __LINE__, __func__, request->url);
+
             continue;
         }
 
