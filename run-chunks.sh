@@ -1,6 +1,8 @@
 #!/bin/sh
 
 export HTTP_TRANSPORT_PROTOCOL=SCTP
+export HTTP_USE_PIPELINING=NO
+export HTTP_DEBUG=LOG_PRG
 echo $HTTP_TRANSPORT_PROTOCOL
 time ./phttpget bsd3.nplab.de \
 chunks/chunk-0-0.jpg \

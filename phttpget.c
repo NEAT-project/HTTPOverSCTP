@@ -64,7 +64,7 @@ __FBSDID("$FreeBSD: head/usr.sbin/portsnap/phttpget/phttpget.c 190679 2009-04-03
 #include <strings.h>
 
 /* maximum SCTP streams */
-#define NUM_SCTP_STREAMS    10
+#define MAX_SCTP_STREAMS    100
 #define FIFO_BUFFER_SIZE    1024
 
 #define LOG_PRG             0
@@ -78,19 +78,22 @@ static char *           env_HTTP_TRANSPORT_PROTOCOL;
 static char *           env_HTTP_SCTP_UDP_ENCAPS_PORT;
 static char *           env_HTTP_DEBUG;
 static char *           env_HTTP_PIPE;
+static char *           env_HTTP_USE_PIPELINING;
 
 static struct timeval   timo = {15, 0};
 static uint8_t          log_level = LOG_ERR;                /* 0 = none | 1 = error | 2 = verbose | 3 = very verbose */
 static in_port_t        udp_encaps_port = 0;
 static int              protocol = IPPROTO_SCTP;
-static uint8_t          streamstatus[NUM_SCTP_STREAMS];
-static uint32_t         lastStream = 0;                     /* Last SCTP stream read from */
+static uint16_t         sctp_num_streams = 0;
+static uint8_t          *sctp_stream_status;
+static uint32_t         sctp_last_stream = 0;               /* Last SCTP stream read from */
 static char             *servername;                        /* Name of server to connect with */
-static uint8_t          streamsbusy = 0;                    /* Indicator if all streams are busy */
+static uint8_t          sctp_streams_busy = 0;               /* Indicator if all streams are busy */
 static struct timeval   tv_init;
 
 static uint8_t          use_stdin = 0;                      /* read requests from stdin */
 static uint8_t          use_pipe = 0;                       /* read requests from pipe */
+static uint8_t          use_pipelining = 1;                 /* allow pipelining */
 static uint8_t          save_file = 0;                      /* save received data to file */
 
 /* STATS */
@@ -129,6 +132,7 @@ struct request_queue requests_open;
 struct request_queue requests_pending;
 
 #define MAX(a,b) (((a)>(b))?(a):(b))
+#define MIN(a,b) (((a)<(b))?(a):(b))
 
 #ifndef __FreeBSD__
 /* Locate a substring in a string */
@@ -274,25 +278,31 @@ readenv(void)
         use_pipe = 1;
         mylog(LOG_INF, "Using pipes for requests/reposnses");
     }
+
+    env_HTTP_USE_PIPELINING = getenv("HTTP_USE_PIPELINING");
+    if (env_HTTP_USE_PIPELINING != NULL) {
+        if (strncasecmp(env_HTTP_USE_PIPELINING, "YES", 3) == 0) {
+            use_pipelining = 1;
+        } else if (strncasecmp(env_HTTP_USE_PIPELINING, "NO", 2) == 0) {
+            use_pipelining = 0;
+            mylog(LOG_INF, "Pipelining support disabled");
+        }
+    }
 }
 
 static int
 setup_connection(struct addrinfo *res, int *sd) {
-    int tempindex = 0;
+    int i = 0;
     struct sctp_initmsg initmsg;    /* To signal die number of incoming and outgoing streams */
     int val;                        /* Value used for setsockopt call */
+    struct sctp_status status;      /* To reuest SCTP status information */
 #ifdef SCTP_REMOTE_UDP_ENCAPS_PORT
     struct sctp_udpencaps encaps;   /* SCTP/UDP information */
 #endif
 #ifdef __linux__
     struct sctp_event_subscribe subscribe;
 #endif
-
-
-    /* Initialize the stream status array */
-    for (tempindex = 0; tempindex < NUM_SCTP_STREAMS; tempindex++) {
-        streamstatus[tempindex] = STREAM_FREE;
-    }
+    socklen_t statuslen = 0;
 
     /* No addresses left to try :-( */
     if (res == NULL) {
@@ -315,8 +325,8 @@ setup_connection(struct addrinfo *res, int *sd) {
     /* set SCTP specific options */
     if (protocol == IPPROTO_SCTP) {
         /* Ensure an appropriate number of stream will be negotated. */
-        initmsg.sinit_num_ostreams = NUM_SCTP_STREAMS;
-        initmsg.sinit_max_instreams = NUM_SCTP_STREAMS;
+        initmsg.sinit_num_ostreams = MAX_SCTP_STREAMS;
+        initmsg.sinit_max_instreams = MAX_SCTP_STREAMS;
         initmsg.sinit_max_attempts = 0;   /* Use default */
         initmsg.sinit_max_init_timeo = 0; /* Use default */
         if (setsockopt(*sd, IPPROTO_SCTP, SCTP_INITMSG, (char*) &initmsg, sizeof(initmsg)) < 0) {
@@ -374,7 +384,32 @@ setup_connection(struct addrinfo *res, int *sd) {
         return -1;
     }
 
-    mylog(LOG_ERR, "[%d][%s] - connected", __LINE__, __func__);
+if (protocol == IPPROTO_SCTP) {
+    /* Get the actual number of outgoing streams. */
+    statuslen = sizeof(status);
+    memset(&status, 0, sizeof(status));
+    if (getsockopt(*sd, IPPROTO_SCTP, SCTP_STATUS, &status, &statuslen) < 0) {
+        mylog(LOG_ERR, "[%d][%s] - setsockopt failed", __LINE__, __func__);
+        exit(EXIT_FAILURE);
+    }
+
+    sctp_num_streams = MIN(status.sstat_instrms, status.sstat_outstrms);
+
+    /* Allocate stream status array */
+    if ((sctp_stream_status = malloc(sizeof(uint8_t) * sctp_num_streams)) == NULL) {
+        mylog(LOG_ERR, "[%d][%s] - malloc failed", __LINE__, __func__);
+    }
+
+    /* Initialize the stream status array */
+    for (i = 0; i < sctp_num_streams; i++) {
+        sctp_stream_status[i] = STREAM_FREE;
+    }
+
+    mylog(LOG_INF, "[%d][%s] - SCTP available Streams: %d IN - %d OUT - using: %d", __LINE__, __func__, status.sstat_instrms, status.sstat_outstrms, sctp_num_streams);
+}
+
+
+    mylog(LOG_INF, "[%d][%s] - connected", __LINE__, __func__);
     return 0;
 }
 
@@ -439,7 +474,7 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
 
 #ifdef __FreeBSD__
             rcvinfo = (struct sctp_rcvinfo *)CMSG_DATA(scmsg);
-            lastStream = rcvinfo->rcv_sid;
+            sctp_last_stream = rcvinfo->rcv_sid;
 #endif
 #ifdef __linux__
             rcvinfo = (struct sctp_sndrcvinfo *)CMSG_DATA(scmsg);
@@ -554,7 +589,7 @@ send_request(int sd,  char *reqbuf, int *reqbuflen, int *reqbufpos) {
     msghdr.msg_iov = &iov;
     msghdr.msg_iovlen = 1;
 
-    mylog(LOG_INF, "[%d][%s] - %s", __LINE__, __func__, reqbuf + *reqbufpos);
+    mylog(LOG_DBG, "[%d][%s] - %s", __LINE__, __func__, reqbuf + *reqbufpos);
 
     /* if using SCTP, append control msg to define outgoing stream */
     if (protocol == IPPROTO_SCTP) {
@@ -574,26 +609,26 @@ send_request(int sd,  char *reqbuf, int *reqbuflen, int *reqbufpos) {
 #endif
 
 
-        streamsbusy = 1;
+        sctp_streams_busy = 1;
 
         /* lookup next free stream - if all streams busy return with -2 */
-        for (i = 0; i < NUM_SCTP_STREAMS; i++) {
-            if (streamstatus[i] == STREAM_FREE) {
-                streamstatus[i] = STREAM_USED;
+        for (i = 0; i < sctp_num_streams; i++) {
+            if (sctp_stream_status[i] == STREAM_FREE) {
+                sctp_stream_status[i] = STREAM_USED;
 #ifdef __FreeBSD__
                 sndinfo->snd_sid = i;
 #endif
 #ifdef __linux__
                 sndinfo->sinfo_stream = i;
 #endif
-                streamsbusy = 0;
+                sctp_streams_busy = 0;
                 break;
             }
         }
 
-        if (streamsbusy == 1) {
+        if (sctp_streams_busy == 1) {
             mylog(LOG_INF, "[%d][%s] - all SCTP streams are busy...", __LINE__, __func__);
-            return -2;
+            return 0;
         }
     }
 
@@ -602,9 +637,16 @@ send_request(int sd,  char *reqbuf, int *reqbuflen, int *reqbufpos) {
         iov.iov_base = reqbuf + *reqbufpos;
         iov.iov_len = *reqbuflen - *reqbufpos;
 
-        if ((len = sendmsg(sd, &msghdr, 0)) < 0) {
-            mylog(LOG_ERR, "[%d][%s] - sendmsg() failed...", __LINE__, __func__);
-            break;
+        len = sendmsg(sd, &msghdr, 0);
+
+        /* sendmsg failed - but don't worry - non-blocking :) */
+        if (len == -1) {
+            if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                mylog(LOG_DBG, "[%d][%s] - sendmsg() failed - EWOULDBLOCK", __LINE__, __func__);
+                break;
+            } else {
+                return -1;
+            }
         }
 
         /* move reqbufpos by sent bytes */
@@ -646,7 +688,7 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
 
         stat_bytes_header += strlen(hln) + 2;
 
-        mylog(LOG_INF, "[%d][%s] - %s", __LINE__, __func__, hln);
+        mylog(LOG_DBG, "[%d][%s] - %s", __LINE__, __func__, hln);
 
         /* Make sure it doesn't contain a NUL character */
         if (strchr(hln, '\0') != eolp) {
@@ -668,7 +710,7 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
              * Transfer-Encoding: chunked header to
              * tell us the length.
              */
-            if (hln[7] != '0') {
+            if (hln[7] != '0' && use_pipelining) {
                 *pipelined = 1;
             }
 
@@ -705,7 +747,7 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
                 *keepalive = 1;
             }
 
-            mylog(LOG_INF, "[%d][%s] - Keep-Alive : %d - Pipelined : %d", __LINE__, __func__, *keepalive, *pipelined);
+            mylog(LOG_DBG, "[%d][%s] - Keep-Alive : %d - Pipelined : %d", __LINE__, __func__, *keepalive, *pipelined);
 
             /* Next header... */
             continue;
@@ -884,9 +926,9 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
 
     mylog(LOG_INF, "#####################");
     if (protocol == IPPROTO_SCTP) {
-        mylog(LOG_PRG, "%d - %d - %s - sctp sid: %d", stat_status_200 + stat_status_404 + stat_status_other, statuscode, request->url, lastStream);
+        mylog(LOG_PRG, "#%d - %d - %s - sctp sid: %d", stat_status_200 + stat_status_404 + stat_status_other, statuscode, request->url, sctp_last_stream);
     } else {
-        mylog(LOG_PRG, "%d - %d - %s", stat_status_200 + stat_status_404 + stat_status_other, statuscode, request->url);
+        mylog(LOG_PRG, "#%d - %d - %s", stat_status_200 + stat_status_404 + stat_status_other, statuscode, request->url);
     }
     mylog(LOG_INF, "\t HEADER   : %d", stat_bytes_header - bytes_header_tmp);
     mylog(LOG_INF, "\t PAYLOAD  : %d", stat_bytes_payload - bytes_payload_tmp);
@@ -901,7 +943,7 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
             len_left = sizeof(struct sctp_pipe_data);
             while (len_left > 0) {
                 len = write(fifo_out_fd, &(request->pipe_data) + sizeof(struct sctp_pipe_data) - len_left, len_left);
-                mylog(LOG_INF, "[%d][%s] - fifo write : %d byte", __LINE__, __func__, len);
+                mylog(LOG_DBG, "[%d][%s] - fifo write : %d byte", __LINE__, __func__, len);
                 if (len == -1 || len == 0) {
                     mylog(LOG_ERR, "[%d][%s] - fifo write failed: %d - %s", __LINE__, __func__, errno, strerror(errno));
                 }
@@ -1051,9 +1093,9 @@ main(int argc, char *argv[])
             maxfd = MAX(sd, fifo_in_fd) + 1;
         } else if (use_stdin) {
             maxfd = MAX(sd, STDIN_FILENO) + 1;
+        } else {
+            maxfd = sd + 1;
         }
-
-        //fprintf(stderr, "waiting... open: %d - pending: %d - finished: %d\n", num_req_open, num_req_pending, num_req_finished);
 
         /* Select section - handle stdin and socket */
         if ((selectsock = select(maxfd, &fdsetrecv, &fdsetsend, NULL, NULL)) < 0) {
@@ -1063,7 +1105,7 @@ main(int argc, char *argv[])
 
         /* Ready to read a new request from stdin */
         if (use_stdin && FD_ISSET(STDIN_FILENO, &fdsetrecv)) {
-            mylog(LOG_INF, "[%d][%s] - select for STDIN", __LINE__, __func__);
+            mylog(LOG_DBG, "[%d][%s] - select for STDIN", __LINE__, __func__);
 
             if ((request = malloc(sizeof(struct request))) == NULL) {
                 mylog(LOG_ERR, "[%d][%s] - malloc failed", __LINE__, __func__);
@@ -1092,7 +1134,7 @@ main(int argc, char *argv[])
 
         /* Ready to read a new request from FIFO */
         if (use_pipe && FD_ISSET(fifo_in_fd, &fdsetrecv)) {
-            mylog(LOG_INF, "[%d][%s] - select for FIFO", __LINE__, __func__);
+            mylog(LOG_DBG, "[%d][%s] - select for FIFO", __LINE__, __func__);
 
             if ((request = malloc(sizeof(struct request))) == NULL) {
                 mylog(LOG_ERR, "[%d][%s] - malloc failed", __LINE__, __func__);
@@ -1102,7 +1144,7 @@ main(int argc, char *argv[])
             len_left = sizeof(struct sctp_pipe_data);
             while (len_left > 0) {
                 len = read(fifo_in_fd, &(request->pipe_data) + sizeof(struct sctp_pipe_data) - len_left, len_left);
-                mylog(LOG_INF, "[%d][%s] - fifo read : %d byte", __LINE__, __func__, len);
+                mylog(LOG_DBG, "[%d][%s] - fifo read : %d byte", __LINE__, __func__, len);
                 if (len == 0) {
                     mylog(LOG_ERR, "[%d][%s] - fifo read failed - pipe closed", __LINE__, __func__);
                     use_pipe = 0;
@@ -1132,12 +1174,12 @@ main(int argc, char *argv[])
 
         /* Ready to recv from socket */
         if (FD_ISSET(sd, &fdsetrecv)) {
-            mylog(LOG_INF, "[%d][%s] - select for sd recv", __LINE__, __func__);
+            mylog(LOG_DBG, "[%d][%s] - select for sd recv", __LINE__, __func__);
         }
 
         /* Ready to send from socket */
         if (FD_ISSET(sd, &fdsetsend)) {
-            mylog(LOG_INF, "[%d][%s] - select for sd send", __LINE__, __func__);
+            mylog(LOG_DBG, "[%d][%s] - select for sd send", __LINE__, __func__);
         }
 
         /*
@@ -1164,12 +1206,15 @@ main(int argc, char *argv[])
                 }
 
                 if ((reqbuflen = asprintf(&reqbuf,
-                    "GET /%s HTTP/1.1\r\n"
+                    "GET %s%s HTTP/1.1\r\n"
                     "Host: %s\r\n"
                     "User-Agent: %s\r\n"
                     "%s"
                     "\r\n",
-                    request->url, servername, env_HTTP_USER_AGENT,
+                    (request->url[0] == 47) ? "" : "/",
+                    request->url,
+                    servername,
+                    env_HTTP_USER_AGENT,
                     (num_req_open == 1 && !use_pipe && !use_stdin) ? "Connection: Close\r\n" : "Connection: Keep-Alive\r\n"
                 )) == -1) {
                     mylog(LOG_ERR, "[%d][%s] - asprintf failed", __LINE__, __func__);
@@ -1179,8 +1224,8 @@ main(int argc, char *argv[])
                 reqbufpos = 0;
             }
 
-            /* If in pipelined mode, try to send the request */
-            if (pipelined && streamsbusy == 0) {
+            /* If in pipelined mode or some streams not busy : send request */
+            if (pipelined || (protocol == IPPROTO_SCTP && sctp_streams_busy == 0)) {
                 if (send_request(sd, reqbuf, &reqbuflen, &reqbufpos) == -1) {
                     mylog(LOG_ERR, "[%d][%s] - send_request() failed", __LINE__, __func__);
                     goto conndied; //handle more precisely...
@@ -1188,9 +1233,6 @@ main(int argc, char *argv[])
 
                 if (reqbufpos < reqbuflen) {
                     mylog(LOG_ERR, "[%d][%s] - reqbufpos < reqbuflen or all streams busy...", __LINE__, __func__);
-                    if (errno != EAGAIN && streamsbusy == 0) {
-                        goto conndied;
-                    }
                     break;
                 } else {
                     free(reqbuf);
@@ -1220,9 +1262,8 @@ main(int argc, char *argv[])
         }
 
         /* sending last request ... do we need to blocking-send a request? */
-        //felix : num_req_open > 0 ?
-        if (num_req_pending == 0 && num_req_open > 0 && streamsbusy == 0) {
-            mylog(LOG_INF, "blocking send_request()");
+        //felix : num_req_pending == 0 ?
+        if (num_req_pending == 0 && num_req_open > 0 && sctp_streams_busy == 0) {
             if (send_request(sd, reqbuf, &reqbuflen, &reqbufpos) == -1) {
                 mylog(LOG_ERR, "[%d][%s] - send_request() failed", __LINE__, __func__);
                 goto conndied; //handle more precisely...
@@ -1230,7 +1271,7 @@ main(int argc, char *argv[])
 
             if (reqbufpos < reqbuflen) {
                 mylog(LOG_ERR, "[%d][%s] - reqbufpos < reqbuflen or all streams busy...", __LINE__, __func__);
-                if (errno != EAGAIN && streamsbusy == 0) {
+                if (errno != EAGAIN && sctp_streams_busy == 0) {
                     goto conndied;
                 }
             } else {
@@ -1247,7 +1288,7 @@ main(int argc, char *argv[])
 
                 num_req_open--;
                 num_req_pending++;
-                mylog(LOG_INF, "[%d][%s] - %s : open -> pending (blocking part)", __LINE__, __func__, request->url);
+                mylog(LOG_INF, "[%d][%s] - %s : open -> pending (blocking)", __LINE__, __func__, request->url);
             }
         }
 
@@ -1269,9 +1310,11 @@ main(int argc, char *argv[])
                 /* We've finished this file! */
                 num_req_pending--;
                 num_req_finished++;
-                streamstatus[lastStream] = STREAM_FREE;
-                /* at least one stream is free for a new request */
-                streamsbusy = 0;
+                if (protocol == IPPROTO_SCTP) {
+                    sctp_stream_status[sctp_last_stream] = STREAM_FREE;
+                    /* at least one stream is free for a new request */
+                    sctp_streams_busy = 0;
+                }
             }
 
         } else if (request == NULL) {
