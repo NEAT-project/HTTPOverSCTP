@@ -479,7 +479,7 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
 #endif
 #ifdef __linux__
             rcvinfo = (struct sctp_sndrcvinfo *)CMSG_DATA(scmsg);
-            lastStream = rcvinfo->sinfo_stream;
+            sctp_last_stream = rcvinfo->sinfo_stream;
 #endif
 
         }
