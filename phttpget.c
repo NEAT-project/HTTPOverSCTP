@@ -398,6 +398,7 @@ if (protocol == IPPROTO_SCTP) {
     /* Allocate stream status array */
     if ((sctp_stream_status = malloc(sizeof(uint8_t) * sctp_num_streams)) == NULL) {
         mylog(LOG_ERR, "[%d][%s] - malloc failed", __LINE__, __func__);
+        exit(EXIT_FAILURE);
     }
 
     /* Initialize the stream status array */
@@ -1032,7 +1033,7 @@ main(int argc, char *argv[])
     res = res0;
 
     /* setup connection before waiting for fifo */
-    setup_connection(res, &sd);
+    //setup_connection(res, &sd);
 
     if (argc < 3) {
         if (use_pipe) {
