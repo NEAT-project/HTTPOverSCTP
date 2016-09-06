@@ -672,6 +672,7 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
     uint32_t bytes_payload_tmp = stat_bytes_payload;
     int len = 0;
     int len_left = 0;
+    char * bufptr = NULL;
 
     *keepalive = 0;
 
@@ -942,8 +943,9 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
             request->pipe_data.size_payload = stat_bytes_payload - bytes_payload_tmp;
 
             len_left = sizeof(struct sctp_pipe_data);
+            bufptr = (char *) &(request->pipe_data);
             while (len_left > 0) {
-                len = write(fifo_out_fd, &(request->pipe_data) + sizeof(struct sctp_pipe_data) - len_left, len_left);
+                len = write(fifo_out_fd, bufptr + sizeof(struct sctp_pipe_data) - len_left, len_left);
                 mylog(LOG_DBG, "[%d][%s] - fifo write : %d byte", __LINE__, __func__, len);
                 if (len == -1 || len == 0) {
                     mylog(LOG_ERR, "[%d][%s] - fifo write failed: %d - %s", __LINE__, __func__, errno, strerror(errno));
@@ -988,6 +990,7 @@ main(int argc, char *argv[])
     int len = 0;
     int len_left = 0;
     uint8_t num_req = 0;
+    char *bufptr = NULL;
 
     /* Initialize open (unsent) requests and pending requests queues */
     TAILQ_INIT(&requests_open);
@@ -1143,8 +1146,9 @@ main(int argc, char *argv[])
             }
 
             len_left = sizeof(struct sctp_pipe_data);
+            bufptr = (char *) &(request->pipe_data);
             while (len_left > 0) {
-                len = read(fifo_in_fd, &(request->pipe_data) + sizeof(struct sctp_pipe_data) - len_left, len_left);
+                len = read(fifo_in_fd, bufptr + sizeof(struct sctp_pipe_data) - len_left, len_left);
                 mylog(LOG_DBG, "[%d][%s] - fifo read : %d byte", __LINE__, __func__, len);
                 if (len == 0) {
                     mylog(LOG_ERR, "[%d][%s] - fifo read failed - pipe closed", __LINE__, __func__);
