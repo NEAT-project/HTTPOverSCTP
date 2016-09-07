@@ -113,17 +113,19 @@ enum stream_status {STREAM_FREE, STREAM_USED};
 
 struct sctp_pipe_data {
     uint32_t    id;
-    uint32_t    pathlen;
-    uint32_t    size_header;
-    uint32_t    size_payload;
+    uint32_t    path_len;
+    uint32_t    cookie_len;
+    uint32_t    header_len;
+    uint32_t    payload_len;
     char        path[FIFO_BUFFER_SIZE];
 } __attribute__ ((packed));
 
 struct request {
-    uint32_t    id;
-    char *url;
-    struct sctp_pipe_data pipe_data;
-    TAILQ_ENTRY(request) entries;
+    uint32_t                id;
+    char                    *cookie;
+    char                    *url;
+    struct sctp_pipe_data   pipe_data;
+    TAILQ_ENTRY(request)    entries;
 };
 
 TAILQ_HEAD(request_queue, request);
@@ -939,8 +941,8 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
     /* write response to pipe */
     if (use_pipe) {
         if ((request = TAILQ_FIRST(&requests_pending)) != NULL) {
-            request->pipe_data.size_header = stat_bytes_header - bytes_header_tmp;
-            request->pipe_data.size_payload = stat_bytes_payload - bytes_payload_tmp;
+            request->pipe_data.header_len = stat_bytes_header - bytes_header_tmp;
+            request->pipe_data.payload_len = stat_bytes_payload - bytes_payload_tmp;
 
             len_left = sizeof(struct sctp_pipe_data);
             bufptr = (char *) &(request->pipe_data);
@@ -1169,6 +1171,19 @@ main(int argc, char *argv[])
             num_req++;
             request->id = request->pipe_data.id;
             request->url = request->pipe_data.path;
+
+            if (request->pipe_data.cookie_len > 0) {
+                if ((bufptr = malloc(sizeof(char) * request->pipe_data.cookie_len + 1)) == NULL) {
+                    mylog(LOG_ERR, "[%d][%s] - malloc failed", __LINE__, __func__);
+                    exit(EXIT_FAILURE);
+                }
+                memset(bufptr, 97, request->pipe_data.cookie_len);
+                bufptr[request->pipe_data.cookie_len] = '\0';
+                asprintf(&(request->cookie), "Cookie: %s\r\n", bufptr);
+            } else {
+                request->cookie = NULL;
+            }
+
             //snprintf(request->url, BUFSIZ, "%s", request->pipe_data.path);
             TAILQ_INSERT_TAIL(&requests_open, request, entries);
             num_req_open++;
@@ -1214,13 +1229,15 @@ main(int argc, char *argv[])
                     "GET %s%s HTTP/1.1\r\n"
                     "Host: %s\r\n"
                     "User-Agent: %s\r\n"
-                    "%s"
+                    "%s\r\n"
+                    "%s" //cookie
                     "\r\n",
                     (request->url[0] == 47) ? "" : "/",
                     request->url,
                     servername,
                     env_HTTP_USER_AGENT,
-                    (num_req_open == 1 && !use_pipe && !use_stdin) ? "Connection: Close\r\n" : "Connection: Keep-Alive\r\n"
+                    (num_req_open == 1 && !use_pipe && !use_stdin) ? "Connection: Close" : "Connection: Keep-Alive",
+                    (request->cookie != NULL) ? request->cookie : ""
                 )) == -1) {
                     mylog(LOG_ERR, "[%d][%s] - asprintf failed", __LINE__, __func__);
                     exit(EXIT_FAILURE);
