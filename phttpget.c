@@ -64,8 +64,9 @@ __FBSDID("$FreeBSD: head/usr.sbin/portsnap/phttpget/phttpget.c 190679 2009-04-03
 #include <strings.h>
 
 /* maximum SCTP streams */
-#define MAX_SCTP_STREAMS    100
-#define FIFO_BUFFER_SIZE    1024
+#define MAX_SCTP_STREAMS        100
+#define FIFO_BUFFER_SIZE        1024
+#define RESPONSE_BUFFER_SIZE    1048576
 
 #define LOG_PRG             0
 #define LOG_ERR             1
@@ -81,7 +82,7 @@ static char *           env_HTTP_PIPE;
 static char *           env_HTTP_USE_PIPELINING;
 
 static struct timeval   timo = {15, 0};
-static uint8_t          log_level = LOG_ERR;                /* 0 = none | 1 = error | 2 = verbose | 3 = very verbose */
+static uint8_t          log_level = LOG_ERR;	             /* 0 = none | 1 = error | 2 = verbose | 3 = very verbose */
 static in_port_t        udp_encaps_port = 0;
 static int              protocol = IPPROTO_SCTP;
 static uint16_t         sctp_num_streams = 0;
@@ -386,30 +387,30 @@ setup_connection(struct addrinfo *res, int *sd) {
         return -1;
     }
 
-if (protocol == IPPROTO_SCTP) {
-    /* Get the actual number of outgoing streams. */
-    statuslen = sizeof(status);
-    memset(&status, 0, sizeof(status));
-    if (getsockopt(*sd, IPPROTO_SCTP, SCTP_STATUS, &status, &statuslen) < 0) {
-        mylog(LOG_ERR, "[%d][%s] - setsockopt failed", __LINE__, __func__);
-        exit(EXIT_FAILURE);
+    if (protocol == IPPROTO_SCTP) {
+        /* Get the actual number of outgoing streams. */
+        statuslen = sizeof(status);
+        memset(&status, 0, sizeof(status));
+        if (getsockopt(*sd, IPPROTO_SCTP, SCTP_STATUS, &status, &statuslen) < 0) {
+            mylog(LOG_ERR, "[%d][%s] - setsockopt failed", __LINE__, __func__);
+            exit(EXIT_FAILURE);
+        }
+
+        sctp_num_streams = MIN(status.sstat_instrms, status.sstat_outstrms);
+
+        /* Allocate stream status array */
+        if ((sctp_stream_status = malloc(sizeof(uint8_t) * sctp_num_streams)) == NULL) {
+            mylog(LOG_ERR, "[%d][%s] - malloc failed", __LINE__, __func__);
+            exit(EXIT_FAILURE);
+        }
+
+        /* Initialize the stream status array */
+        for (i = 0; i < sctp_num_streams; i++) {
+            sctp_stream_status[i] = STREAM_FREE;
+        }
+
+        mylog(LOG_INF, "[%d][%s] - SCTP available Streams: %d IN - %d OUT - using: %d", __LINE__, __func__, status.sstat_instrms, status.sstat_outstrms, sctp_num_streams);
     }
-
-    sctp_num_streams = MIN(status.sstat_instrms, status.sstat_outstrms);
-
-    /* Allocate stream status array */
-    if ((sctp_stream_status = malloc(sizeof(uint8_t) * sctp_num_streams)) == NULL) {
-        mylog(LOG_ERR, "[%d][%s] - malloc failed", __LINE__, __func__);
-        exit(EXIT_FAILURE);
-    }
-
-    /* Initialize the stream status array */
-    for (i = 0; i < sctp_num_streams; i++) {
-        sctp_stream_status[i] = STREAM_FREE;
-    }
-
-    mylog(LOG_INF, "[%d][%s] - SCTP available Streams: %d IN - %d OUT - using: %d", __LINE__, __func__, status.sstat_instrms, status.sstat_outstrms, sctp_num_streams);
-}
 
 
     mylog(LOG_INF, "[%d][%s] - connected", __LINE__, __func__);
@@ -443,15 +444,21 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
         }
 
         /* If the buffer is full, complain */
-        if (*resbuflen == BUFSIZ) {
+        if (*resbuflen == RESPONSE_BUFFER_SIZE) {
             mylog(LOG_INF, "[%d][%s] - buffer is full", __LINE__, __func__);
             exit(EXIT_FAILURE);
             return -1;
         }
 
+        /* message orientated protocol - new message : new response */
+        if (protocol == IPPROTO_SCTP) {
+            *resbuflen = 0;
+            *resbufpos = 0;
+        }
+
         /* Read more data into the buffer */
         iov.iov_base = resbuf + *resbuflen;
-        iov.iov_len = BUFSIZ - *resbuflen;
+        iov.iov_len = RESPONSE_BUFFER_SIZE - *resbuflen;
         msg.msg_name = NULL;
         msg.msg_namelen = 0;
         msg.msg_iov = &iov;
@@ -459,7 +466,6 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
         msg.msg_control = cmsgbuf;
         msg.msg_controllen = sizeof(cmsgbuf);
         len = recvmsg(sd, &msg, 0);
-
 
         if ((MSG_NOTIFICATION & msg.msg_flags)) {
             mylog(LOG_ERR, "[%d][%s] - recvmsg - got notification - fixme", __LINE__, __func__);
@@ -539,7 +545,7 @@ copybytes(int sd, int fd, off_t copylen, char *resbuf, int *resbuflen, int *resb
         }
 
         iov.iov_base = resbuf;
-        iov.iov_len = BUFSIZ;
+        iov.iov_len = RESPONSE_BUFFER_SIZE;
         msg.msg_name = NULL;
         msg.msg_namelen = 0;
         msg.msg_iov = &iov;
@@ -678,11 +684,24 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
 
     *keepalive = 0;
 
-    do {
-        /* Get a header line */
+    if (protocol == IPPROTO_SCTP) {
+        *resbufpos = 0;
+        *resbuflen = 0;
+
+        /* Get a header line - only once for SCTP */
         if (readln(*sd, resbuf, resbuflen, resbufpos)) {
             mylog(LOG_ERR, "[%d][%s] - readln() failed", __LINE__, __func__);
             return -1;
+        }
+    }
+
+    do {
+        if (protocol == IPPROTO_TCP) {
+            /* Get a header line - stream based TCP*/
+            if (readln(*sd, resbuf, resbuflen, resbufpos)) {
+                mylog(LOG_ERR, "[%d][%s] - readln() failed", __LINE__, __func__);
+                return -1;
+            }
         }
 
         hln = resbuf + *resbufpos;
@@ -887,7 +906,7 @@ handle_response(int *sd, int *fd, char *resbuf, int *resbuflen, int *resbufpos, 
             eolp = strstr(hln, "\r\n");
             *resbufpos = (eolp - resbuf) + 2;
         } while (hln != eolp);
-    } else if (contentlength != -1) {
+    } else if (contentlength != -1 || protocol == IPPROTO_SCTP) {
         if (copybytes(*sd, *fd, contentlength, resbuf, resbuflen, resbufpos)) {
             mylog(LOG_ERR, "[%d][%s] - copybytes failed", __LINE__, __func__);
             *keepalive = 0;
@@ -1012,7 +1031,7 @@ main(int argc, char *argv[])
     servername = argv[1];
 
     /* Allocate response buffer */
-    if ((resbuf = malloc(BUFSIZ)) == NULL) {
+    if ((resbuf = malloc(RESPONSE_BUFFER_SIZE)) == NULL) {
         mylog(LOG_ERR, "[%d][%s] - malloc failed", __LINE__, __func__);
     }
 
@@ -1061,6 +1080,7 @@ main(int argc, char *argv[])
             num_req++;
             request->id = num_req;
             request->url = argv[i];
+            request->cookie = NULL;
             mylog(LOG_INF, "[%d][%s] - queueing : %s", __LINE__, __func__, request->url);
             TAILQ_INSERT_TAIL(&requests_open, request, entries);
             num_req_open++;
@@ -1130,6 +1150,7 @@ main(int argc, char *argv[])
                 num_req++;
                 request->id = num_req;
                 request->url[strcspn(request->url, "\n")] = 0;
+                request->cookie = NULL;
                 TAILQ_INSERT_TAIL(&requests_open, request, entries);
                 num_req_open++;
 
