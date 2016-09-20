@@ -494,7 +494,7 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
 
         /* If recvmsg returned 0 or -1 (no interrupt) - we stop reading */
         if ((len == 0) || ((len == -1) && (errno != EINTR))) {
-            mylog(LOG_ERR, "[%d][%s] - recvmsg returned %d - %s", len, strerror(errno), __LINE__, __func__);
+            mylog(LOG_ERR, "[%d][%s] - recvmsg returned %d - %s", __LINE__, __func__, len, strerror(errno));
             return -1;
         } else if (len > 0) {
             *resbuflen += len;
