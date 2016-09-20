@@ -1200,7 +1200,10 @@ main(int argc, char *argv[])
                 }
                 memset(bufptr, 97, request->pipe_data.cookie_len);
                 bufptr[request->pipe_data.cookie_len] = '\0';
-                asprintf(&(request->cookie), "Cookie: %s\r\n", bufptr);
+                if (asprintf(&(request->cookie), "Cookie: %s\r\n", bufptr) == -1) {
+		    mylog(LOG_ERR, "[%d][%s] - asprintf failed", __LINE__, __func__);
+		    exit(EXIT_FAILURE);
+		}
             } else {
                 request->cookie = NULL;
             }
