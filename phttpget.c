@@ -339,6 +339,11 @@ setup_connection(struct addrinfo *res, int *sd) {
 
         val = 1;
 
+        if (setsockopt(*sd, IPPROTO_SCTP, SCTP_NODELAY, (char*) &val, sizeof(val)) < 0) {
+            mylog(LOG_ERR, "[%d][%s] - setsockopt failed", __LINE__, __func__);
+            exit(EXIT_FAILURE);
+        }
+
 #ifdef __FreeBSD__
         /* Enable RCVINFO delivery */
         if (setsockopt(*sd, IPPROTO_SCTP, SCTP_RECVRCVINFO, (char*) &val, sizeof(val)) < 0) {
