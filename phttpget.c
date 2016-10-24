@@ -288,7 +288,7 @@ readenv(void)
             use_pipelining = 1;
         } else if (strncasecmp(env_HTTP_USE_PIPELINING, "NO", 2) == 0) {
             use_pipelining = 0;
-            mylog(LOG_INF, "Pipelining support disabled");
+            mylog(LOG_PRG, "Pipelining support disabled");
         }
     }
 }
@@ -1201,9 +1201,9 @@ main(int argc, char *argv[])
                 memset(bufptr, 97, request->pipe_data.cookie_len);
                 bufptr[request->pipe_data.cookie_len] = '\0';
                 if (asprintf(&(request->cookie), "Cookie: %s\r\n", bufptr) == -1) {
-		    mylog(LOG_ERR, "[%d][%s] - asprintf failed", __LINE__, __func__);
-		    exit(EXIT_FAILURE);
-		}
+                  mylog(LOG_ERR, "[%d][%s] - asprintf failed", __LINE__, __func__);
+                  exit(EXIT_FAILURE);
+                }
             } else {
                 request->cookie = NULL;
             }
@@ -1271,7 +1271,7 @@ main(int argc, char *argv[])
             }
 
             /* If in pipelined mode or some streams not busy : send request */
-            if (pipelined || (protocol == IPPROTO_SCTP && sctp_streams_busy == 0)) {
+            if (pipelined && sctp_streams_busy == 0) {
                 if (send_request(sd, reqbuf, &reqbuflen, &reqbufpos) == -1) {
                     mylog(LOG_ERR, "[%d][%s] - send_request() failed", __LINE__, __func__);
                     goto conndied; //handle more precisely...
