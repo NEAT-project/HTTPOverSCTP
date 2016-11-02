@@ -1,10 +1,10 @@
 #!/bin/sh
 
 export HTTP_TRANSPORT_PROTOCOL=SCTP
-export HTTP_USE_PIPELINING=NO
+export HTTP_USE_PIPELINING=YES
 export HTTP_DEBUG=LOG_PRG
-echo $HTTP_TRANSPORT_PROTOCOL
-time ./phttpget bsd3.nplab.de \
+export HTTP_SCTP_MAX_STREAMS=2
+./phttpget bsd3.nplab.de \
 chunks/chunk-0-0.jpg \
 chunks/chunk-0-1.jpg \
 chunks/chunk-0-2.jpg \
