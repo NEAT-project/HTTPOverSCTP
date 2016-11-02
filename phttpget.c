@@ -220,7 +220,7 @@ readenv(void)
     char *p;
     long http_timeout;
     long port;
-    long sctp_max_streams;
+    long sctp_max_streams_temp;
 
     env_HTTP_USER_AGENT = getenv("HTTP_USER_AGENT");
     if (env_HTTP_USER_AGENT == NULL) {
@@ -300,11 +300,12 @@ readenv(void)
 
     env_HTTP_SCTP_MAX_STREAMS = getenv("HTTP_SCTP_MAX_STREAMS");
     if (env_HTTP_SCTP_MAX_STREAMS != NULL) {
-        sctp_max_streams = strtol(env_HTTP_SCTP_MAX_STREAMS, NULL, 10);
-        if (sctp_max_streams < 1 || sctp_max_streams > 65536) {
+        sctp_max_streams_temp = strtol(env_HTTP_SCTP_MAX_STREAMS, NULL, 10);
+        if (sctp_max_streams_temp < 1 || sctp_max_streams_temp > 65536) {
             mylog(LOG_ERR, "sctp_max_streams out of range");
             exit(EXIT_FAILURE);
         }
+	sctp_max_streams = (uint16_t) sctp_max_streams_temp;
     }
 
     if (protocol == IPPROTO_SCTP && use_pipelining) {
