@@ -59,7 +59,6 @@
 #include <strings.h>
 
 /* maximum SCTP streams */
-#define MAX_SCTP_STREAMS        100
 #define FIFO_BUFFER_SIZE        1024
 #define RESPONSE_BUFFER_SIZE    1048576
 
@@ -75,6 +74,7 @@ static char *           env_HTTP_SCTP_UDP_ENCAPS_PORT;
 static char *           env_HTTP_DEBUG;
 static char *           env_HTTP_PIPE;
 static char *           env_HTTP_USE_PIPELINING;
+static char *           env_HTTP_SCTP_MAX_STREAMS;
 
 static struct timeval   timo = {15, 0};
 static uint8_t          log_level = LOG_ERR;	             /* 0 = none | 1 = error | 2 = verbose | 3 = very verbose */
@@ -90,7 +90,7 @@ static uint8_t          use_stdin = 0;                      /* read requests fro
 static uint8_t          use_pipe = 0;                       /* read requests from pipe */
 static uint8_t          use_pipelining = 1;                 /* allow pipelining */
 static uint8_t          save_file = 0;                      /* save received data to file */
-static uint16_t         max_sctp_streams = MAX_SCTP_STREAMS;/* limit number of SCTP streams */
+static uint16_t         sctp_max_streams = 100;             /* limit number of SCTP streams */
 
 /* STATS */
 static uint32_t         stat_bytes_header = 0;
@@ -220,6 +220,7 @@ readenv(void)
     char *p;
     long http_timeout;
     long port;
+    long sctp_max_streams;
 
     env_HTTP_USER_AGENT = getenv("HTTP_USER_AGENT");
     if (env_HTTP_USER_AGENT == NULL) {
@@ -231,10 +232,13 @@ readenv(void)
         http_timeout = strtol(env_HTTP_TIMEOUT, &p, 10);
         if ((*env_HTTP_TIMEOUT == '\0') || (*p != '\0') || (http_timeout < 0)) {
             mylog(LOG_ERR, "HTTP_TIMEOUT (%s) is not a positive integer", env_HTTP_TIMEOUT);
+            exit(EXIT_FAILURE);
         } else {
             timo.tv_sec = http_timeout;
         }
     }
+    mylog(LOG_PRG, "Settings - timeout : %d", timo.tv_sec);
+
     env_HTTP_TRANSPORT_PROTOCOL = getenv("HTTP_TRANSPORT_PROTOCOL");
     if (env_HTTP_TRANSPORT_PROTOCOL != NULL) {
         if (strncasecmp(env_HTTP_TRANSPORT_PROTOCOL, "TCP", 3) == 0) {
@@ -243,14 +247,17 @@ readenv(void)
             protocol = IPPROTO_SCTP;
         } else {
             mylog(LOG_ERR, "HTTP_TRANSPORT_PROTOCOL (%s) not supported", env_HTTP_TRANSPORT_PROTOCOL);
+            exit(EXIT_FAILURE);
         }
     }
+    mylog(LOG_PRG, "Settings - protocol : %s", (protocol == IPPROTO_TCP) ? "TCP" : "SCTP");
 
     env_HTTP_SCTP_UDP_ENCAPS_PORT = getenv("HTTP_SCTP_UDP_ENCAPS_PORT");
     if (env_HTTP_SCTP_UDP_ENCAPS_PORT != NULL) {
         port = strtol(env_HTTP_SCTP_UDP_ENCAPS_PORT, &p, 10);
         if ((*env_HTTP_SCTP_UDP_ENCAPS_PORT == '\0') || (*p != '\0') || (port < 0) || (port > 65535)) {
             mylog(LOG_ERR, "HTTP_SCTP_UDP_ENCAPS_PORT (%s) is not a valid port number", env_HTTP_SCTP_UDP_ENCAPS_PORT);
+            exit(EXIT_FAILURE);
         } else {
             udp_encaps_port = (in_port_t)port;
         }
@@ -268,6 +275,7 @@ readenv(void)
             log_level = LOG_DBG;
         } else {
             mylog(LOG_ERR, "unknown debug level");
+            exit(EXIT_FAILURE);
         }
     }
 
@@ -283,9 +291,27 @@ readenv(void)
             use_pipelining = 1;
         } else if (strncasecmp(env_HTTP_USE_PIPELINING, "NO", 2) == 0) {
             use_pipelining = 0;
-            mylog(LOG_PRG, "Pipelining support disabled");
+        } else {
+            mylog(LOG_ERR, "invalid settings for pipelining support");
+            exit(EXIT_FAILURE);
         }
     }
+    mylog(LOG_PRG, "Settings - pipelining : %s", (use_pipelining == 1) ? "enabled" : "disabled");
+
+    env_HTTP_SCTP_MAX_STREAMS = getenv("HTTP_SCTP_MAX_STREAMS");
+    if (env_HTTP_SCTP_MAX_STREAMS != NULL) {
+        sctp_max_streams = strtol(env_HTTP_SCTP_MAX_STREAMS, NULL, 10);
+        if (sctp_max_streams < 1 || sctp_max_streams > 65536) {
+            mylog(LOG_ERR, "sctp_max_streams out of range");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    if (protocol == IPPROTO_SCTP && use_pipelining) {
+        mylog(LOG_PRG, "Settings - max SCTP streams : %d", sctp_max_streams);
+    }
+
+
 }
 
 static int
@@ -323,8 +349,8 @@ setup_connection(struct addrinfo *res, int *sd) {
     /* set SCTP specific options */
     if (protocol == IPPROTO_SCTP) {
         /* Ensure an appropriate number of stream will be negotated. */
-        initmsg.sinit_num_ostreams = MAX_SCTP_STREAMS;
-        initmsg.sinit_max_instreams = MAX_SCTP_STREAMS;
+        initmsg.sinit_num_ostreams = sctp_max_streams;
+        initmsg.sinit_max_instreams = sctp_max_streams;
         initmsg.sinit_max_attempts = 0;   /* Use default */
         initmsg.sinit_max_init_timeo = 0; /* Use default */
         if (setsockopt(*sd, IPPROTO_SCTP, SCTP_INITMSG, (char*) &initmsg, sizeof(initmsg)) < 0) {
