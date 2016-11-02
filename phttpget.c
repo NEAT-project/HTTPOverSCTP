@@ -24,11 +24,6 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifdef __FreeBSD__
-#include <sys/cdefs.h>
-__FBSDID("$FreeBSD: head/usr.sbin/portsnap/phttpget/phttpget.c 190679 2009-04-03 21:13:18Z cperciva $");
-#endif
-
 #ifdef __linux__
 #define _GNU_SOURCE
 #define OFF_MAX LONG_MAX
@@ -89,13 +84,13 @@ static uint16_t         sctp_num_streams = 0;
 static uint8_t          *sctp_stream_status;
 static uint32_t         sctp_last_stream = 0;               /* Last SCTP stream read from */
 static char             *servername;                        /* Name of server to connect with */
-static uint8_t          sctp_streams_busy = 0;               /* Indicator if all streams are busy */
+static uint8_t          sctp_streams_busy = 0;              /* Indicator if all streams are busy */
 static struct timeval   tv_init;
-
 static uint8_t          use_stdin = 0;                      /* read requests from stdin */
 static uint8_t          use_pipe = 0;                       /* read requests from pipe */
 static uint8_t          use_pipelining = 1;                 /* allow pipelining */
 static uint8_t          save_file = 0;                      /* save received data to file */
+static uint16_t         max_sctp_streams = MAX_SCTP_STREAMS;/* limit number of SCTP streams */
 
 /* STATS */
 static uint32_t         stat_bytes_header = 0;
