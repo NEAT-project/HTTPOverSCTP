@@ -500,7 +500,15 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
             continue;
         }
 
-        if (protocol == IPPROTO_SCTP) {
+        /* If recvmsg returned 0 or -1 (no interrupt) - we stop reading */
+        if ((len == 0) || ((len == -1) && (errno != EINTR))) {
+            mylog(LOG_ERR, "[%d][%s] - recvmsg returned %d - %s", __LINE__, __func__, len, strerror(errno));
+            return -1;
+        } else if (len > 0) {
+            *resbuflen += len;
+        }
+        
+	if (protocol == IPPROTO_SCTP) {
             /* Stream we received data from */
             scmsg = CMSG_FIRSTHDR(&msg);
             if (scmsg == NULL) {
@@ -519,13 +527,6 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
 
         }
 
-        /* If recvmsg returned 0 or -1 (no interrupt) - we stop reading */
-        if ((len == 0) || ((len == -1) && (errno != EINTR))) {
-            mylog(LOG_ERR, "[%d][%s] - recvmsg returned %d - %s", __LINE__, __func__, len, strerror(errno));
-            return -1;
-        } else if (len > 0) {
-            *resbuflen += len;
-        }
     }
 
     return 0;
