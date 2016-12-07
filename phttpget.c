@@ -1463,7 +1463,7 @@ cleanupconn:
 
     mylog(LOG_PRG, "###### STATS ######");
     mylog(LOG_PRG, "\trequests      : %d", num_req_finished);
-    mylog(LOG_PRG, "\t- # 202       : %d", stat_status_200);
+    mylog(LOG_PRG, "\t- # 200       : %d", stat_status_200);
     mylog(LOG_PRG, "\t- # 404       : %d", stat_status_404);
     mylog(LOG_PRG, "\t- # other     : %d", stat_status_other);
     mylog(LOG_PRG, "\tbytes header  : %d", stat_bytes_header);
