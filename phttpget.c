@@ -1305,7 +1305,7 @@ main(int argc, char *argv[])
                 }
 
                 if (reqbufpos < reqbuflen) {
-                    mylog(LOG_ERR, "[%d][%s] - reqbufpos < reqbuflen or all streams busy...", __LINE__, __func__);
+                    mylog(LOG_INF, "[%d][%s] - reqbufpos (%d) < reqbuflen (%d) or all streams busy...", __LINE__, __func__, reqbufpos, reqbuflen);
                     break;
                 } else {
                     free(reqbuf);
