@@ -500,7 +500,15 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
             continue;
         }
 
-        if (protocol == IPPROTO_SCTP) {
+        /* If recvmsg returned 0 or -1 (no interrupt) - we stop reading */
+        if ((len == 0) || ((len == -1) && (errno != EINTR))) {
+            mylog(LOG_ERR, "[%d][%s] - recvmsg returned %d - %s", __LINE__, __func__, len, strerror(errno));
+            return -1;
+        } else if (len > 0) {
+            *resbuflen += len;
+        }
+        
+	if (protocol == IPPROTO_SCTP) {
             /* Stream we received data from */
             scmsg = CMSG_FIRSTHDR(&msg);
             if (scmsg == NULL) {
@@ -519,13 +527,6 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
 
         }
 
-        /* If recvmsg returned 0 or -1 (no interrupt) - we stop reading */
-        if ((len == 0) || ((len == -1) && (errno != EINTR))) {
-            mylog(LOG_ERR, "[%d][%s] - recvmsg returned %d - %s", __LINE__, __func__, len, strerror(errno));
-            return -1;
-        } else if (len > 0) {
-            *resbuflen += len;
-        }
     }
 
     return 0;
@@ -1462,7 +1463,7 @@ cleanupconn:
 
     mylog(LOG_PRG, "###### STATS ######");
     mylog(LOG_PRG, "\trequests      : %d", num_req_finished);
-    mylog(LOG_PRG, "\t- # 202       : %d", stat_status_200);
+    mylog(LOG_PRG, "\t- # 200       : %d", stat_status_200);
     mylog(LOG_PRG, "\t- # 404       : %d", stat_status_404);
     mylog(LOG_PRG, "\t- # other     : %d", stat_status_other);
     mylog(LOG_PRG, "\tbytes header  : %d", stat_bytes_header);
