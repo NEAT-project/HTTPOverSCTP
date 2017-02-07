@@ -76,7 +76,7 @@ static char *           env_HTTP_PIPE;
 static char *           env_HTTP_USE_PIPELINING;
 static char *           env_HTTP_SCTP_MAX_STREAMS;
 
-static struct timeval   timo = {15, 0};
+static struct timeval   timo = {0, 0};
 static uint8_t          log_level = LOG_ERR;	             /* 0 = none | 1 = error | 2 = verbose | 3 = very verbose */
 static in_port_t        udp_encaps_port = 0;
 static int              protocol = IPPROTO_SCTP;
@@ -343,7 +343,7 @@ setup_connection(struct addrinfo *res, int *sd) {
         return -1;
     }
 
-    /* ... set 15-second timeouts ... */
+    /* ... set timeouts ... */
     setsockopt(*sd, SOL_SOCKET, SO_SNDTIMEO, (void *)&timo, (socklen_t)sizeof(timo));
     setsockopt(*sd, SOL_SOCKET, SO_RCVTIMEO, (void *)&timo, (socklen_t)sizeof(timo));
 
