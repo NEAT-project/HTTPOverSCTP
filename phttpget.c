@@ -336,7 +336,7 @@ setup_connection(struct addrinfo *res, int *sd) {
     }
 
     /* Create a socket... */
-    *sd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    *sd = socket(res->ai_family, res->ai_socktype, protocol);
     if (*sd == -1) {
         /* reatry... */
         mylog(LOG_ERR, "[%d][%s] - socket() failed", __LINE__, __func__);
@@ -366,15 +366,13 @@ setup_connection(struct addrinfo *res, int *sd) {
             exit(EXIT_FAILURE);
         }
 
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__APPLE__)
         /* Enable RCVINFO delivery */
         if (setsockopt(*sd, IPPROTO_SCTP, SCTP_RECVRCVINFO, (char*) &val, sizeof(val)) < 0) {
             mylog(LOG_ERR, "[%d][%s] - setsockopt failed", __LINE__, __func__);
             exit(EXIT_FAILURE);
         }
-#endif
-
-#ifdef __linux__
+#elif defined(__linux__)
         /* sorry michael ... i know this must hurt you! :) */
         memset(&subscribe, 0, sizeof(subscribe));
         subscribe.sctp_data_io_event = val;
@@ -384,20 +382,23 @@ setup_connection(struct addrinfo *res, int *sd) {
             exit(EXIT_FAILURE);
         }
 #endif
-
-#ifdef SCTP_REMOTE_UDP_ENCAPS_PORT
-        /* Use UDP encapsulation for SCTP */
-        memset(&encaps, 0, sizeof(encaps));
-        encaps.sue_address.ss_family = res->ai_family;
-        encaps.sue_address.ss_len = res->ai_addrlen;
-        encaps.sue_port = htons(udp_encaps_port);
-        setsockopt(*sd, IPPROTO_SCTP, SCTP_REMOTE_UDP_ENCAPS_PORT, (void *)&encaps, (socklen_t)sizeof(encaps));
-#else
         if (udp_encaps_port > 0) {
+#ifdef SCTP_REMOTE_UDP_ENCAPS_PORT
+            /* Use UDP encapsulation for SCTP */
+            memset(&encaps, 0, sizeof(encaps));
+            encaps.sue_address.ss_family = res->ai_family;
+            encaps.sue_address.ss_len = res->ai_addrlen;
+            encaps.sue_port = htons(udp_encaps_port);
+            if (setsockopt(*sd, IPPROTO_SCTP, SCTP_REMOTE_UDP_ENCAPS_PORT, (void *)&encaps, (socklen_t)sizeof(encaps))) {
+                mylog(LOG_ERR, "[%d][%s] - setsockopt failed", __LINE__, __func__);
+                exit(EXIT_FAILURE);
+            }
+            mylog(LOG_PRG, "Settings - UDP encapsulation port : %d", udp_encaps_port);
+#else
             mylog(LOG_ERR, "[%d][%s] - UDP encapsulation unsupported", __LINE__, __func__);
             exit(EXIT_FAILURE);
-        }
 #endif
+}
     }
 
 #ifdef SO_NOSIGPIPE
@@ -451,12 +452,11 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
     struct msghdr msg;
     struct iovec iov;
     struct cmsghdr *scmsg;
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__APPLE__)
     char cmsgbuf[CMSG_SPACE(sizeof(struct sctp_rcvinfo))];
     struct sctp_rcvinfo *rcvinfo;
     memset(cmsgbuf, 0, CMSG_SPACE(sizeof(struct sctp_rcvinfo)));
-#endif
-#ifdef __linux__
+#elif defined(__linux__)
     char cmsgbuf[CMSG_SPACE(sizeof(struct sctp_sndrcvinfo))];
     struct sctp_sndrcvinfo *rcvinfo;
     memset(cmsgbuf, 0, CMSG_SPACE(sizeof(struct sctp_sndrcvinfo)));
@@ -497,7 +497,6 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
         if ((MSG_NOTIFICATION & msg.msg_flags)) {
             mylog(LOG_ERR, "[%d][%s] - recvmsg - got notification - fixme", __LINE__, __func__);
             exit(EXIT_FAILURE);
-            continue;
         }
 
         /* If recvmsg returned 0 or -1 (no interrupt) - we stop reading */
@@ -507,7 +506,7 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
         } else if (len > 0) {
             *resbuflen += len;
         }
-        
+
 	if (protocol == IPPROTO_SCTP) {
             /* Stream we received data from */
             scmsg = CMSG_FIRSTHDR(&msg);
@@ -516,11 +515,10 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
                 exit(EXIT_FAILURE);
             }
 
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__APPLE__)
             rcvinfo = (struct sctp_rcvinfo *)CMSG_DATA(scmsg);
             sctp_last_stream = rcvinfo->rcv_sid;
-#endif
-#ifdef __linux__
+#elif defined(__linux__)
             rcvinfo = (struct sctp_sndrcvinfo *)CMSG_DATA(scmsg);
             sctp_last_stream = rcvinfo->sinfo_stream;
 #endif
@@ -539,11 +537,10 @@ copybytes(int sd, int fd, off_t copylen, char *resbuf, int *resbuflen, int *resb
     ssize_t len;
     struct msghdr msg;
     struct iovec iov;
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__APPLE__)
     char cmsgbuf[CMSG_SPACE(sizeof(struct sctp_rcvinfo))];
     memset(cmsgbuf, 0, CMSG_SPACE(sizeof(struct sctp_rcvinfo)));
-#endif
-#ifdef __linux__
+#elif defined(__linux__)
     char cmsgbuf[CMSG_SPACE(sizeof(struct sctp_sndrcvinfo))];
     memset(cmsgbuf, 0, CMSG_SPACE(sizeof(struct sctp_sndrcvinfo)));
 #endif
@@ -603,11 +600,10 @@ copybytes(int sd, int fd, off_t copylen, char *resbuf, int *resbuflen, int *resb
 
 static int
 send_request(int sd,  char *reqbuf, int *reqbuflen, int *reqbufpos) {
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__APPLE__)
     char* cmsgbuf[CMSG_SPACE(sizeof(struct sctp_sndinfo))];
     struct sctp_sndinfo *sndinfo;
-#endif
-#ifdef __linux__
+#elif defined(__linux__)
     char cmsgbuf[CMSG_SPACE(sizeof(struct sctp_sndrcvinfo))];
     struct sctp_sndrcvinfo *sndinfo;
 #endif
@@ -636,11 +632,10 @@ send_request(int sd,  char *reqbuf, int *reqbuflen, int *reqbufpos) {
         cmsg = CMSG_FIRSTHDR(&msghdr);
         cmsg->cmsg_level = IPPROTO_SCTP;
         cmsg->cmsg_len = sizeof(cmsgbuf);
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__APPLE__)
         cmsg->cmsg_type = SCTP_SNDINFO;
         sndinfo = (struct sctp_sndinfo*) CMSG_DATA(cmsg);
-#endif
-#ifdef __linux__
+#elif defined(__linux__)
         cmsg->cmsg_type = SCTP_SNDRCV;
         sndinfo = (struct sctp_sndrcvinfo*) CMSG_DATA(cmsg);
 #endif
@@ -652,10 +647,9 @@ send_request(int sd,  char *reqbuf, int *reqbuflen, int *reqbufpos) {
         for (i = 0; i < sctp_num_streams; i++) {
             if (sctp_stream_status[i] == STREAM_FREE) {
                 sctp_stream_status[i] = STREAM_USED;
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__APPLE__)
                 sndinfo->snd_sid = i;
-#endif
-#ifdef __linux__
+#elif defined(__linux__)
                 sndinfo->sinfo_stream = i;
 #endif
                 sctp_streams_busy = 0;
@@ -1067,7 +1061,7 @@ main(int argc, char *argv[])
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = PF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = protocol;
+    hints.ai_protocol = IPPROTO_TCP;
 #ifdef __FreeBSD__
     error = getaddrinfo(servername, "http", &hints, &res0);
 #else
