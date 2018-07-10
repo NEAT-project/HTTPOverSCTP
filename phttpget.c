@@ -402,7 +402,7 @@ main(int argc, char *argv[])
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = PF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_protocol = protocol;
+	hints.ai_protocol = IPPROTO_TCP;
 #ifdef __FreeBSD__
 	error = getaddrinfo(env_HTTP_PROXY ? env_HTTP_PROXY : servername,
 	    env_HTTP_PROXY ? proxyport : "http", &hints, &res0);
@@ -429,10 +429,10 @@ main(int argc, char *argv[])
 				errx(1, "Could not connect to %s", servername);
 
 			/* Create a socket... */
-			sd = socket(res->ai_family, res->ai_socktype,
-			    res->ai_protocol);
-			if (sd == -1)
+			sd = socket(res->ai_family, res->ai_socktype, protocol);
+			if (sd == -1) {
 				continue;
+			}
 
 			/* ... set 15-second timeouts ... */
 			setsockopt(sd, SOL_SOCKET, SO_SNDTIMEO,
