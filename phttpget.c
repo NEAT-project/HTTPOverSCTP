@@ -374,7 +374,7 @@ setup_connection(struct addrinfo *res, int *sd) {
         exit(EXIT_FAILURE);
     }
 
-    mylog(LOG_ERR, "[%d][%s] - Candidate : %s %d", __LINE__, __func__, addr_str , res->ai_family);
+    mylog(LOG_PRG, "[%d][%s] - Candidate : %s %d", __LINE__, __func__, addr_str , res->ai_family);
 
 
     if (res->ai_family == AF_INET || res->ai_family == AF_INET6) {
