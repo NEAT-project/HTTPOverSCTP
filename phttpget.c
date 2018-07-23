@@ -77,7 +77,7 @@ static char *           env_HTTP_USE_PIPELINING;
 static char *           env_HTTP_SCTP_MAX_STREAMS;
 
 static struct timeval   timo = {0, 0};
-static uint8_t          log_level = LOG_ERR;	             /* 0 = none | 1 = error | 2 = verbose | 3 = very verbose */
+static uint8_t          log_level = LOG_ERR;                /* 0 = none | 1 = error | 2 = verbose | 3 = very verbose */
 static in_port_t        udp_encaps_port = 0;
 static int              protocol = IPPROTO_SCTP;
 static uint16_t         sctp_num_streams = 0;
@@ -305,7 +305,7 @@ readenv(void)
             mylog(LOG_ERR, "sctp_max_streams out of range");
             exit(EXIT_FAILURE);
         }
-	sctp_max_streams = (uint16_t) sctp_max_streams_temp;
+        sctp_max_streams = (uint16_t) sctp_max_streams_temp;
     }
 
     if (protocol == IPPROTO_SCTP && use_pipelining) {
@@ -334,6 +334,12 @@ setup_connection(struct addrinfo *res, int *sd) {
         mylog(LOG_ERR, "[%d][%s] - Could not connect to %s", __LINE__, __func__, servername);
         exit(EXIT_FAILURE);
     }
+    if (res->ai_family == AF_INET || res->ai_family == AF_INET6) {
+      mylog(LOG_PRG, "[%d][%s] - Using IPv%d", __LINE__, __func__, (res->ai_family == AF_INET) ? (4) : (6));
+    } else {
+      mylog(LOG_ERR, "[%d][%s] - unknown address family", __LINE__, __func__);
+      exit(EXIT_FAILURE);
+    }
 
     /* Create a socket... */
     *sd = socket(res->ai_family, res->ai_socktype, protocol);
@@ -355,21 +361,21 @@ setup_connection(struct addrinfo *res, int *sd) {
         initmsg.sinit_max_attempts = 0;   /* Use default */
         initmsg.sinit_max_init_timeo = 0; /* Use default */
         if (setsockopt(*sd, IPPROTO_SCTP, SCTP_INITMSG, (char*) &initmsg, sizeof(initmsg)) < 0) {
-            mylog(LOG_ERR, "[%d][%s] - setsockopt failed", __LINE__, __func__);
+            mylog(LOG_ERR, "[%d][%s] - setsockopt() failed", __LINE__, __func__);
             exit(EXIT_FAILURE);
         }
 
         val = 1;
 
         if (setsockopt(*sd, IPPROTO_SCTP, SCTP_NODELAY, (char*) &val, sizeof(val)) < 0) {
-            mylog(LOG_ERR, "[%d][%s] - setsockopt failed", __LINE__, __func__);
+            mylog(LOG_ERR, "[%d][%s] - setsockopt() failed", __LINE__, __func__);
             exit(EXIT_FAILURE);
         }
 
 #if defined(__FreeBSD__) || defined(__APPLE__)
         /* Enable RCVINFO delivery */
         if (setsockopt(*sd, IPPROTO_SCTP, SCTP_RECVRCVINFO, (char*) &val, sizeof(val)) < 0) {
-            mylog(LOG_ERR, "[%d][%s] - setsockopt failed", __LINE__, __func__);
+            mylog(LOG_ERR, "[%d][%s] - setsockopt() failed", __LINE__, __func__);
             exit(EXIT_FAILURE);
         }
 #elif defined(__linux__)
@@ -378,7 +384,7 @@ setup_connection(struct addrinfo *res, int *sd) {
         subscribe.sctp_data_io_event = val;
         /* subscribe.sctp_association_event = val; */
         if (setsockopt(*sd, SOL_SCTP, SCTP_EVENTS, (char *)&subscribe, sizeof(subscribe)) < 0) {
-            mylog(LOG_ERR, "[%d][%s] - setsockopt failed", __LINE__, __func__);
+            mylog(LOG_ERR, "[%d][%s] - setsockopt() failed", __LINE__, __func__);
             exit(EXIT_FAILURE);
         }
 #endif
@@ -390,7 +396,7 @@ setup_connection(struct addrinfo *res, int *sd) {
             encaps.sue_address.ss_len = res->ai_addrlen;
             encaps.sue_port = htons(udp_encaps_port);
             if (setsockopt(*sd, IPPROTO_SCTP, SCTP_REMOTE_UDP_ENCAPS_PORT, (void *)&encaps, (socklen_t)sizeof(encaps))) {
-                mylog(LOG_ERR, "[%d][%s] - setsockopt failed", __LINE__, __func__);
+                mylog(LOG_ERR, "[%d][%s] - setsockopt() failed", __LINE__, __func__);
                 exit(EXIT_FAILURE);
             }
             mylog(LOG_PRG, "Settings - UDP encapsulation port : %d", udp_encaps_port);
@@ -420,7 +426,7 @@ setup_connection(struct addrinfo *res, int *sd) {
         statuslen = sizeof(status);
         memset(&status, 0, sizeof(status));
         if (getsockopt(*sd, IPPROTO_SCTP, SCTP_STATUS, &status, &statuslen) < 0) {
-            mylog(LOG_ERR, "[%d][%s] - setsockopt failed", __LINE__, __func__);
+            mylog(LOG_ERR, "[%d][%s] - setsockopt() failed", __LINE__, __func__);
             exit(EXIT_FAILURE);
         }
 
@@ -507,7 +513,7 @@ readln(int sd, char *resbuf, int *resbuflen, int *resbufpos)
             *resbuflen += len;
         }
 
-	if (protocol == IPPROTO_SCTP) {
+        if (protocol == IPPROTO_SCTP) {
             /* Stream we received data from */
             scmsg = CMSG_FIRSTHDR(&msg);
             if (scmsg == NULL) {
@@ -1059,7 +1065,7 @@ main(int argc, char *argv[])
 
     /* Server lookup */
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = PF_UNSPEC;
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 #ifdef __FreeBSD__
@@ -1383,6 +1389,9 @@ main(int argc, char *argv[])
                     /* at least one stream is free for a new request */
                     sctp_streams_busy = 0;
                 }
+            } else {
+                mylog(LOG_PRG, "[%d][%s] - handle_response() failed - aborting", __LINE__, __func__);
+                exit(EXIT_FAILURE);
             }
 
         } else if (request == NULL) {
