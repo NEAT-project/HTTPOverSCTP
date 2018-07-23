@@ -7,6 +7,7 @@
 #export HTTP_DEBUG=LOG_DBG # LOG_PRG|LOG_ERR|LOG_INF|LOG_DBG
 #export HTTP_SCTP_MAX_STREAMS=2
 #export HTTP_PIPE=NO # use pipes (e.g. for pReplay)
+#export HTTP_IP_PROTOCOL=6
 
 export HTTP_TRANSPORT_PROTOCOL=TCP
 ./phttpget bsd3.nplab.de files/16M

@@ -75,6 +75,7 @@ static char *           env_HTTP_DEBUG;
 static char *           env_HTTP_PIPE;
 static char *           env_HTTP_USE_PIPELINING;
 static char *           env_HTTP_SCTP_MAX_STREAMS;
+static char *           env_HTTP_IP_PROTOCOL;
 
 static struct timeval   timo = {0, 0};
 static uint8_t          log_level = LOG_ERR;                /* 0 = none | 1 = error | 2 = verbose | 3 = very verbose */
@@ -91,6 +92,7 @@ static uint8_t          use_pipe = 0;                       /* read requests fro
 static uint8_t          use_pipelining = 1;                 /* allow pipelining */
 static uint8_t          save_file = 0;                      /* save received data to file */
 static uint16_t         sctp_max_streams = 100;             /* limit number of SCTP streams */
+static uint8_t          ip_protocol = 0;                    /* 0 = both | 4 = IPv4 | 6 = IPv6 */
 
 /* STATS */
 static uint32_t         stat_bytes_header = 0;
@@ -221,6 +223,7 @@ readenv(void)
     long http_timeout;
     long port;
     long sctp_max_streams_temp;
+    long ip_protocol_temp;
 
     env_HTTP_USER_AGENT = getenv("HTTP_USER_AGENT");
     if (env_HTTP_USER_AGENT == NULL) {
@@ -308,6 +311,18 @@ readenv(void)
         sctp_max_streams = (uint16_t) sctp_max_streams_temp;
     }
 
+    env_HTTP_IP_PROTOCOL = getenv("HTTP_IP_PROTOCOL");
+    if (env_HTTP_IP_PROTOCOL != NULL) {
+        ip_protocol_temp = strtol(env_HTTP_IP_PROTOCOL, NULL, 10);
+        if (ip_protocol_temp == 0 || ip_protocol_temp == 4 || ip_protocol_temp == 6) {
+            ip_protocol = (uint16_t) ip_protocol_temp;
+        } else {
+            mylog(LOG_ERR, "ip_protocol out of range - shoud be 0/4/6");
+            exit(EXIT_FAILURE);
+        }
+
+    }
+
     if (protocol == IPPROTO_SCTP && use_pipelining) {
         mylog(LOG_PRG, "Settings - max SCTP streams : %d", sctp_max_streams);
     }
@@ -335,10 +350,10 @@ setup_connection(struct addrinfo *res, int *sd) {
         exit(EXIT_FAILURE);
     }
     if (res->ai_family == AF_INET || res->ai_family == AF_INET6) {
-      mylog(LOG_PRG, "[%d][%s] - Using IPv%d", __LINE__, __func__, (res->ai_family == AF_INET) ? (4) : (6));
+        mylog(LOG_PRG, "[%d][%s] - Using IPv%d", __LINE__, __func__, (res->ai_family == AF_INET) ? (4) : (6));
     } else {
-      mylog(LOG_ERR, "[%d][%s] - unknown address family", __LINE__, __func__);
-      exit(EXIT_FAILURE);
+        mylog(LOG_ERR, "[%d][%s] - unknown address family", __LINE__, __func__);
+        exit(EXIT_FAILURE);
     }
 
     /* Create a socket... */
@@ -1122,7 +1137,14 @@ main(int argc, char *argv[])
 
         /* Make sure we have a connected socket */
         for (; sd == -1; res = res->ai_next) {
-            setup_connection(res, &sd);
+            if (ip_protocol > 0 && res->family == ip_protocol) {
+                setup_connection(res, &sd);
+            }
+        }
+
+        if (sd == -1) {
+            mylog(LOG_ERR, "[%d][%s] - no transport connection!", __LINE__, __func__);
+            exit(EXIT_FAILURE);
         }
 
         /* Initialize select structs */
