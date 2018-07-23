@@ -37,6 +37,8 @@
 #include <netinet/in.h>
 #include <netinet/sctp.h>
 
+#include <arpa/inet.h>
+
 #include <ctype.h>
 #include <err.h>
 #include <errno.h>
@@ -92,7 +94,7 @@ static uint8_t          use_pipe = 0;                       /* read requests fro
 static uint8_t          use_pipelining = 1;                 /* allow pipelining */
 static uint8_t          save_file = 0;                      /* save received data to file */
 static uint16_t         sctp_max_streams = 100;             /* limit number of SCTP streams */
-static uint8_t          ip_protocol = 0;                    /* 0 = both | 4 = IPv4 | 6 = IPv6 */
+static int              ip_protocol = AF_UNSPEC;            /* 0 = both | 4 = IPv4 | 6 = IPv6 */
 
 /* STATS */
 static uint32_t         stat_bytes_header = 0;
@@ -314,20 +316,29 @@ readenv(void)
     env_HTTP_IP_PROTOCOL = getenv("HTTP_IP_PROTOCOL");
     if (env_HTTP_IP_PROTOCOL != NULL) {
         ip_protocol_temp = strtol(env_HTTP_IP_PROTOCOL, NULL, 10);
-        if (ip_protocol_temp == 0 || ip_protocol_temp == 4 || ip_protocol_temp == 6) {
-            ip_protocol = (uint16_t) ip_protocol_temp;
-        } else {
-            mylog(LOG_ERR, "ip_protocol out of range - shoud be 0/4/6");
-            exit(EXIT_FAILURE);
+
+        switch (ip_protocol_temp) {
+            case 0:
+                ip_protocol = AF_UNSPEC;
+                break;
+            case 4:
+                ip_protocol = AF_INET;
+                break;
+            case 6:
+                ip_protocol = AF_INET6;
+                break;
+            default:
+                mylog(LOG_ERR, "ip_protocol out of range - shoud be 0/4/6");
+                exit(EXIT_FAILURE);
         }
+
+        mylog(LOG_PRG, "Settings - ip_protocol : %d", ip_protocol);
 
     }
 
     if (protocol == IPPROTO_SCTP && use_pipelining) {
         mylog(LOG_PRG, "Settings - max SCTP streams : %d", sctp_max_streams);
     }
-
-
 }
 
 static int
@@ -349,6 +360,23 @@ setup_connection(struct addrinfo *res, int *sd) {
         mylog(LOG_ERR, "[%d][%s] - Could not connect to %s", __LINE__, __func__, servername);
         exit(EXIT_FAILURE);
     }
+
+    char addr_str[INET6_ADDRSTRLEN];
+    struct sockaddr_in* saddr = (struct sockaddr_in*)res->ai_addr;
+    struct sockaddr_in6* saddr6 = (struct sockaddr_in6*)res->ai_addr;
+
+    if (res->ai_family == AF_INET) {
+        inet_ntop(res->ai_family, &saddr->sin_addr, addr_str, sizeof(addr_str));
+    } else if (res->ai_family == AF_INET6) {
+        inet_ntop(res->ai_family, &saddr6->sin6_addr, addr_str, sizeof(addr_str));
+    } else {
+        mylog(LOG_ERR, "[%d][%s] - Unsupported address family", __LINE__, __func__);
+        exit(EXIT_FAILURE);
+    }
+
+    mylog(LOG_ERR, "[%d][%s] - Candidate : %s %d", __LINE__, __func__, addr_str , res->ai_family);
+
+
     if (res->ai_family == AF_INET || res->ai_family == AF_INET6) {
         mylog(LOG_PRG, "[%d][%s] - Using IPv%d", __LINE__, __func__, (res->ai_family == AF_INET) ? (4) : (6));
     } else {
@@ -1080,7 +1108,7 @@ main(int argc, char *argv[])
 
     /* Server lookup */
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
+    hints.ai_family = ip_protocol;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 #ifdef __FreeBSD__
@@ -1137,9 +1165,7 @@ main(int argc, char *argv[])
 
         /* Make sure we have a connected socket */
         for (; sd == -1; res = res->ai_next) {
-            if (ip_protocol > 0 && res->family == ip_protocol) {
-                setup_connection(res, &sd);
-            }
+            setup_connection(res, &sd);
         }
 
         if (sd == -1) {
