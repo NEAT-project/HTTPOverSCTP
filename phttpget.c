@@ -320,19 +320,22 @@ readenv(void)
         switch (ip_protocol_temp) {
             case 0:
                 ip_protocol = AF_UNSPEC;
+                mylog(LOG_PRG, "Settings - ip_protocol : AF_UNSPEC");
                 break;
             case 4:
                 ip_protocol = AF_INET;
+                mylog(LOG_PRG, "Settings - ip_protocol : AF_INET");
                 break;
             case 6:
                 ip_protocol = AF_INET6;
+                mylog(LOG_PRG, "Settings - ip_protocol : AF_INET6");
                 break;
             default:
                 mylog(LOG_ERR, "ip_protocol out of range - shoud be 0/4/6");
                 exit(EXIT_FAILURE);
         }
 
-        mylog(LOG_PRG, "Settings - ip_protocol : %d", ip_protocol);
+
 
     }
 

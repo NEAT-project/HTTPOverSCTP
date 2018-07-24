@@ -11,14 +11,23 @@
 
 REQUEST_FILE=/files/16M
 REQUEST_HOST=bsd3.nplab.de
+REQUEST_TIMEOUT=20s
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m' # No Color
 
+if [ "$(uname)" == "Darwin" ]; then
+    TIMEOUT_COMMAND='gtimeout'
+else
+    TIMEOUT_COMMAND='timeout'
+fi
+
 runTest(){
-    timeout 20s "$@"
+    ${TIMEOUT_COMMAND} ${REQUEST_TIMEOUT} "$@"
+
     local status=$?
+
     if [ $status -ne 0 ]; then
         printf "${RED}FAIL!${NC}\n\n"
     else
